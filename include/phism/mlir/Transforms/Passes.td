@@ -108,7 +108,7 @@ def LoadSwitch : FunctionPass<"load-switch"> {
 def LiftMemRefSubview : Pass<"lift-memref-subview", "::mlir::ModuleOp"> {
   let summary = "Lift the outermost dims into subview.";
   let constructor = "phism::createLiftMemRefSubviewPass()";
-  let options= [
+  let options = [
     Option<"flatten", "flatten", "bool", /*default=*/"false", "Whether to flatten partitioned dims.">
   ];
 }
@@ -127,6 +127,13 @@ def InlineSCoPAffine : Pass<"inline-scop-affine", "::mlir::ModuleOp"> {
   let constructor = "phism::createInlineSCoPAffinePass()";
   let options = [
 
+  ];
+}
+
+def EmitHLS : FunctionPass<"emit-HLS"> {
+  let summary = "Raise MLIR to HLS C/C++.";
+  let constructor = "phism::createEmitHLSPass()";
+  let options = [
   ];
 }
 

@@ -54,3 +54,7 @@ if [ "${CMAKE_GENERATOR}" == "Ninja" ]; then
 else 
   make -j "$(nproc)"
 fi
+
+echo ""
+echo ">>> DONE: Install LLVM for Phism"
+echo ""

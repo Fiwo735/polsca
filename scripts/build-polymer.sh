@@ -60,3 +60,7 @@ if [ "${CMAKE_GENERATOR}" == "Ninja" ]; then
 else 
   make -j "$(nproc)"
 fi
+
+echo ""
+echo ">>> DONE: Install Polymer for Phism"
+echo ""

@@ -29,6 +29,9 @@ void registerAllPhismPasses() {
   registerSCoPDecompositionPass();
   registerInlineSCoPAffinePass();
   registerLoadSwitchPass();
+  // TODO should EmitHLS pass be registered?
+  // registerEmitHLSPass();
+  // TODO should SystolicArray pass be registered?
 }
 
 } // namespace phism

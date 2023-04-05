@@ -101,6 +101,7 @@ class PbFlowOptions(PhismRunnerOptions):
     skip_vitis: bool = False
     skip_csim: bool = False  # Given cosim = True, you can still turn down csim.
     sanity_check: bool = False  # Run pb-flow in sanity check mode
+    emit_HLS: bool = False # Raise to C/C++ HLS instead of using LLVM IR for running Vitis HLS
 
     array_partition_v2: bool = False  # Use the newer array partition (TODO: migrate)
 
@@ -876,27 +877,23 @@ class PbFlow(PhismRunner):
             (
                 self.generate_tile_sizes()
                 .dump_test_data()
-                .compile_c()
-                .preprocess()
-                .sanity_check()
-                .split_statements()
-                .extract_top_func()
-                .polymer_opt()
-                .sanity_check()
-                .constant_args()
-                .sanity_check()
-                .loop_transforms()
-                .sanity_check()
-                .array_partition()
-                .sanity_check(no_diff=True)
-                .scop_stmt_inline()
-                .sanity_check(no_diff=True)
-                .lower_scf()
-                .lower_llvm()
-                .vitis_opt()
-                .write_tb_tcl_by_llvm()
-                # .run_vitis_on_phism()
-                .run_vitis()
+                ##### C/C++                 #####################
+                .compile_c()                # 1. Polygeist
+                ##### MLIR (unoptimized)    #####################
+                .preprocess()               # 2. mlir-opt
+                .sanity_check()             # 2. mlir-opt
+                ##### MLIR (unoptimized)    #####################
+                .split_statements()         # 3. POLSCA pre-poly
+                .extract_top_func()         # 3. POLSCA pre-poly
+                ##### MLIR (unoptimized)    #####################
+                .polymer_opt()              # 4. Polymer (poly-opt)
+                ##### MLIR (semi optimized) #####################
+                .post_poly()                # 5. POLSCA post-poly
+                ##### MLIR (optimized)      #####################
+                .prepare_for_vitis()        # 6-7
+                ##### LLVM IR or C/C++      #####################
+                .run_vitis()                # 7. Vitis HLS
+                ##### Hardware              #####################
                 # .backup_csim_results()
                 # .copy_design_from_phism_to_tb()
                 # .run_cosim()
@@ -907,6 +904,132 @@ class PbFlow(PhismRunner):
 
             # Log stack
             self.logger.error(traceback.format_exc())
+
+    def prepare_for_vitis(self):
+        return (
+            # Do an MLIR pass that raises MLIR to C/C++ for Vitis HLS to use later and generate TCL for C/C++
+            self.emit_HLS()
+            ##### C/C++                 #####################
+            .write_tb_tcl_for_C()
+            
+        ) if self.options.emit_HLS else (
+            # Use Vitis HLS to process LLVM IR directly (omitting HLS C/C++) and generate TCL for LLVM IR
+            self.lower_scf()            # 6.
+            .lower_llvm()               # 6.
+            ##### LLVM IR               #####################
+            .vitis_opt()                # 7. Vitis HLS
+            .write_tb_tcl_by_llvm()     # 7. Vitis HLS
+        )
+    
+    def emit_HLS(self):
+        """Run Phism emit HLS."""
+        # 1 TODO pass for emitting C/C++, instead of vitis_opt and write_tb_tcl_by_llvm
+        if not self.options.emit_HLS:
+            return self
+
+        src_file, self.cur_file = self.cur_file, self.cur_file.replace(
+            ".mlir", ".cpp"
+        )
+        log_file = self.cur_file.replace(".cpp", ".log")
+
+        # TODO why -emit-HLS is not recognized?
+        args = [
+            self.get_program_abspath("phism-opt"),
+            src_file,
+            f'-emit-HLS',
+            # "-canonicalize", # TODO is canonicalize needed here?
+            "-debug-only=emit-hls",
+        ]
+
+        self.run_command(
+            cmd=" ".join(args),
+            shell=True,
+            stderr=open(log_file, "w"),
+            stdout=open(self.cur_file, "w"),
+            env=self.env,
+        )
+
+        return self
+    
+    def write_tb_tcl_for_C(self):
+        # 2 TODO emit the new tcl file for C-sim
+
+        src_file = self.cur_file
+        base_dir = os.path.dirname(src_file)
+        src_base = os.path.basename(src_file)
+        work_dir = self.work_dir
+        top_func = get_top_func(src_file)
+        # TODO what is pb_dataset?
+        pb_dataset = ""
+        # TODO what is config?
+        tcl_config = ""
+
+        # TODO tbgen.tcl could become a self. attribute
+        phism_vitis_tcl = os.path.join(base_dir, "tbgen.tcl")
+
+        # Write the TCL for Phism.
+        # TODO why was the old .tcl generated via other programs instead of directly?
+        with open(phism_vitis_tcl, "w") as f:
+            f.write(
+                TBGEN_VITIS_TCL.format(
+                    src_dir=base_dir,
+                    src_base=src_base,
+                    work_dir=work_dir,
+                    top_func=top_func,
+                    pb_dataset=pb_dataset,
+                    config=tcl_config,
+                )
+            )
+
+        return self
+
+    def check_if_systolic_array_possible(self):
+        return False
+
+    def post_poly(self):
+        return (
+            # Systolic array possible so use corresponding transforms
+            self.sanity_check()
+            .systolic_array_transform()
+            .sanity_check(no_diff=True)
+
+        ) if self.check_if_systolic_array_possible() else (
+            # Systolic array not possible so use default transforms
+            self.sanity_check()
+            .constant_args()
+            .sanity_check()
+            .loop_transforms()
+            .sanity_check()
+            .array_partition()
+            .sanity_check(no_diff=True)
+            .scop_stmt_inline()
+            .sanity_check(no_diff=True)
+        )
+
+    def systolic_array_transform(self):
+        src_file, self.cur_file = self.cur_file, self.cur_file.replace(
+            ".mlir", ".sa.mlir"
+        )
+        log_file = self.cur_file.replace(".mlir", ".log")
+
+        # 3 TODO implement a dummy pass in SystolicArray.cc
+        # 4 TODO understand the differences in AutoSA generated C code and Polsca to implement a proper transform
+        args = [
+            # phism-opt --lower-to-sa xx.mlir
+        ]
+
+        args = self.filter_disabled(args)
+
+        self.run_command(
+            cmd=" ".join(args),
+            shell=True,
+            stderr=open(log_file, "w"),
+            stdout=open(self.cur_file, "w"),
+            env=self.env,
+        )
+
+        return self
+        
 
     def run_command(
         self, cmd: str = "", cmd_list: Optional[List[str]] = None, **kwargs

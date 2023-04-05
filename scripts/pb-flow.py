@@ -84,6 +84,11 @@ def main():
     parser.add_argument(
         "--diamond-tiling", action="store_true", help="Use diamond tiling"
     )
+    parser.add_argument(
+        "--emit-HLS",
+        action="store_true",
+        help="Raise MLIR to HLS C/C++",
+    )
     args = parser.parse_args()
 
     options = pb_flow.PbFlowOptions(**vars(args))

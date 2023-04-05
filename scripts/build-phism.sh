@@ -36,3 +36,7 @@ CC=gcc CXX=g++ cmake .. \
 # ------------------------- Build and test ---------------------
 
 cmake --build . --target check-phism
+
+echo ""
+echo ">>> DONE: Install Phism "
+echo ""
