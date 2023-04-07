@@ -6,23 +6,28 @@
 
 #include "PassDetail.h"
 
-// TOOD any phism equivalent needed here?
-// #include "mase/mlir/Transform/MaseTransforms.h"
+#include "phism/mlir/Transforms/PhismTransforms.h"
 
 #include "mlir/Analysis/CallGraph.h"
-#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
-#include "mlir/Dialect/Affine/Analysis/Utils.h"
+// #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h" // 1) not found -> works when replaced by removing /Dialect/Affine/
+#include "mlir/Analysis/AffineAnalysis.h"
+// #include "mlir/Dialect/Affine/Analysis/Utils.h" // 2) not found -> works when  replaced by removing /Dialect/Affine/
+#include "mlir/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
+// #include "mlir/Dialect/Func/IR/FuncOps.h" // 3) not found -> doesn't exist in LLVM 14, use mlir:: namespace instead of func::
+// #include "mlir/Dialect/Linalg/IR/Linalg.h" // 4) not found -> seems to be not needed
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
+// #include "mlir/Dialect/SCF/IR/SCF.h" // 5) not found -> works when replaced by removing /IR/
+#include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
-#include "mlir/Tools/mlir-translate/Translation.h"
+// #include "mlir/Tools/mlir-translate/Translation.h" // 6) not found -> works when replaced by removing /Tools/mlir-translate/
+#include "mlir/Translation.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -56,6 +61,20 @@ static llvm::DenseMap<Block *, std::string> blockMap;
 //  quantized precision information and directly generate types in the correct
 //  formats.
 // ------------------------------------------------------
+
+// TODO is this needed?
+namespace {
+struct EmitHLSPipelineOptions : public mlir::PassPipelineOptions<EmitHLSPipelineOptions> {
+  Option<std::string> fileName{
+    *this, "filename",
+    llvm::cl::desc("The output HLS code")
+  };
+  Option<std::string> hlsParam{
+    *this, "hlsparam",
+    llvm::cl::desc("The HLS parameters for quantization")
+  };
+};
+} // namespace
 
 static std::string globalType;
 // Unit/Element type of a value
@@ -177,13 +196,14 @@ static std::vector<QArgType *> parseHlsParam(std::string param) {
   return types;
 }
 
-static void initArgTypeMap(func::FuncOp funcOp, std::string hlsParam) {
+static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
   LLVM_DEBUG(dbgs() << funcOp.getName() << " : " << hlsParam << "\n");
 
   auto types = parseHlsParam(hlsParam);
 
   for (auto &arg : funcOp.getArguments()) {
-    auto arrayType = dyn_cast<ShapedType>(arg.getType());
+    // auto arrayType = dyn_cast<ShapedType>(arg.getType());
+    auto arrayType = arg.getType().dyn_cast<ShapedType>();
     if (!arrayType)
       llvm_unreachable("Function arg has scalar type. This is not supported.");
     if (!arrayType.hasStaticShape())
@@ -241,21 +261,27 @@ static std::string getBlockName(Block *block) {
 }
 
 static std::string getTypeName(Value value) {
-  if (dyn_cast<BlockArgument>(value))
+  // if (dyn_cast<BlockArgument>(value)) // seems to be newer LLVM version
+  if (value.dyn_cast<BlockArgument>())
     return unitTypeMap[value];
 
   auto valueType = value.getType();
-  if (auto arrayType = dyn_cast<ShapedType>(valueType))
+  // if (auto arrayType = dyn_cast<ShapedType>(valueType))
+  if (auto arrayType = valueType.dyn_cast<ShapedType>())
     valueType = arrayType.getElementType();
 
-  if (isa<Float32Type>(valueType))
+  // if (isa<Float32Type>(valueType)) // seems to be newer LLVM version
+  if (valueType.isa<Float32Type>())
     return globalType;
-  if (isa<Float64Type>(valueType))
+  // if (isa<Float64Type>(valueType)) // seems to be newer LLVM version
+  if (valueType.isa<Float64Type>())
     return globalType;
 
-  if (isa<IndexType>(valueType))
+  // if (isa<IndexType>(valueType)) // seems to be newer LLVM version
+  if (valueType.isa<IndexType>())
     return "int";
-  if (auto intType = dyn_cast<IntegerType>(valueType)) {
+  // if (auto intType = dyn_cast<IntegerType>(valueType)) { // seems to be newer LLVM version
+  if (auto intType = valueType.dyn_cast<IntegerType>()) {
     if (intType.getWidth() == 1)
       return "bool";
     else
@@ -453,7 +479,8 @@ static std::string emitOp(memref::CopyOp copyOp) {
          getTypeName(copyOp.getTarget()) + "));\n";
 }
 
-static std::string emitOp(arith::SelectOp selectOp) {
+// static std::string emitOp(arith::SelectOp selectOp) { // SelectOp seems to belong to mlir:: in this LLVM version
+static std::string emitOp(mlir::SelectOp selectOp) {
   return getValueName(selectOp.getResult()) + " = " +
          getValueName(selectOp.getCondition()) + " ? " +
          getValueName(selectOp.getTrueValue()) + " : " +
@@ -519,9 +546,12 @@ static std::string emitBlock(Block &block);
 static std::string emitOp(scf::ForOp forOp) {
   auto iter = forOp.getInductionVar();
   auto iterName = getValueName(iter);
-  auto lowerBound = forOp.getLowerBound();
-  auto upperBound = forOp.getUpperBound();
-  auto step = forOp.getStep();
+  // auto lowerBound = forOp.getLowerBound(); // used in newer LLVM
+  auto lowerBound = forOp.lowerBound();
+  // auto upperBound = forOp.getUpperBound(); // used in newer LLVM
+  auto upperBound = forOp.upperBound();
+  // auto step = forOp.getStep(); // used in newer LLVM
+  auto step = forOp.step();
 
   return "for (" + getTypeName(iter) + " " + iterName + " = " +
          getValueName(lowerBound) + "; " + iterName + " < " +
@@ -531,13 +561,17 @@ static std::string emitOp(scf::ForOp forOp) {
 }
 
 static std::string emitOp(scf::IfOp ifOp) {
-  auto cond = ifOp.getCondition();
+  // auto cond = ifOp.getCondition(); // used in newer LLVM
+  auto cond = ifOp.condition();
   std::string ifBuff;
 
   ifBuff = "if (" + getValueName(cond) + ") {" +
-           emitBlock(ifOp.getThenRegion().front());
-  if (!ifOp.getElseRegion().empty()) {
-    ifBuff += "} else {\n" + emitBlock(ifOp.getElseRegion().front());
+          //  emitBlock(ifOp.getThenRegion().front()); // used in newer LLVM
+           emitBlock(ifOp.thenRegion().front());
+  // if (!ifOp.getElseRegion().empty()) { // used in newer LLVM
+  if (!ifOp.elseRegion().empty()) {
+    // ifBuff += "} else {\n" + emitBlock(ifOp.getElseRegion().front()); // used in newer LLVM
+    ifBuff += "} else {\n" + emitBlock(ifOp.elseRegion().front());
   }
 
   ifBuff += "}\n";
@@ -726,7 +760,8 @@ static std::string emitBlock(Block &block) {
       continue;
 
     // Arith Ops
-    if (auto castOp = dyn_cast<arith::SelectOp>(op)) {
+    // if (auto castOp = dyn_cast<arith::SelectOp>(op)) { // seems to belong to mlir:: in older LLVM
+    if (auto castOp = dyn_cast<mlir::SelectOp>(op)) {
       blockBuff += emitOp(castOp);
       continue;
     }
@@ -887,11 +922,13 @@ static std::string emitBlock(Block &block) {
       blockBuff += emitBinaryFunc(&op, "pow");
       continue;
     }
-    if (auto castOp = dyn_cast<math::AbsIOp>(op)) {
+    // if (auto castOp = dyn_cast<math::AbsIOp>(op)) { // seems to be newer LLVM version
+    if (auto castOp = dyn_cast<math::AbsOp>(op)) {
       blockBuff += emitUnaryOp(&op, "abs");
       continue;
     }
-    if (auto castOp = dyn_cast<math::AbsFOp>(op)) {
+    // if (auto castOp = dyn_cast<math::AbsFOp>(op)) { // seems to be newer LLVM version
+    if (auto castOp = dyn_cast<math::AbsOp>(op)) {
       blockBuff += emitUnaryOp(&op, "abs");
       continue;
     }
@@ -941,7 +978,7 @@ static std::string emitBlock(Block &block) {
 
     // A pre-condition for this pass is that the function must not have return
     // value.
-    if (auto castOp = dyn_cast<func::ReturnOp>(op))
+    if (auto castOp = dyn_cast<mlir::ReturnOp>(op))
       continue;
 
     op.emitError(" is not supported yet.");
@@ -949,29 +986,33 @@ static std::string emitBlock(Block &block) {
   return blockBuff;
 }
 
-static void checkFuncOp(func::FuncOp funcOp) {
+static void checkFuncOp(mlir::FuncOp funcOp) {
   if (funcOp.getBlocks().size() != 1)
     funcOp.emitError(" must contain only one block.");
   if (funcOp.getNumResults() != 0)
     funcOp.emitError(" must contain no result.");
   funcOp.walk([&](AffineForOp op) {
     for (auto result : op.getResults())
-      if (dyn_cast<ShapedType>(result.getType()))
+      // if (dyn_cast<ShapedType>(result.getType())) // seems to be newer LLVM
+      if (result.getType().dyn_cast<ShapedType>())
         op.emitError(" cannot return memref.");
   });
   funcOp.walk([&](scf::ForOp op) {
     for (auto result : op.getResults())
-      if (dyn_cast<ShapedType>(result.getType()))
+      // if (dyn_cast<ShapedType>(result.getType())) // seems to be newer LLVM
+      if (result.getType().dyn_cast<ShapedType>())
         op.emitError(" cannot return memref.");
   });
   funcOp.walk([&](AffineIfOp op) {
     for (auto result : op.getResults())
-      if (dyn_cast<ShapedType>(result.getType()))
+      // if (dyn_cast<ShapedType>(result.getType())) // seems to be newer LLVM
+      if (result.getType().dyn_cast<ShapedType>())
         op.emitError(" cannot return memref.");
   });
   funcOp.walk([&](scf::IfOp op) {
     for (auto result : op.getResults())
-      if (dyn_cast<ShapedType>(result.getType()))
+      // if (dyn_cast<ShapedType>(result.getType())) // seems to be newer LLVM
+      if (result.getType().dyn_cast<ShapedType>())
         op.emitError(" cannot return memref.");
   });
 }
@@ -983,10 +1024,12 @@ static std::string declareValue(Value value) {
   // If it is a constant op, we initiliase it while declaring the
   // variable.
   if (auto constantOp = dyn_cast<arith::ConstantOp>(value.getDefiningOp())) {
-    if (dyn_cast<ShapedType>(type)) {
+    // if (dyn_cast<ShapedType>(type)) { // seems to be newer LLVM
+    if (type.dyn_cast<ShapedType>()) {
       valueBuff += getTypeName(value) + " " + getArrayInit(value) + " = {";
 
-      auto denseAttr = dyn_cast<DenseElementsAttr>(constantOp.getValue());
+      // auto denseAttr = dyn_cast<DenseElementsAttr>(constantOp.getValue()); // seems to be newer LLVM
+      auto denseAttr = constantOp.getValue().dyn_cast<DenseElementsAttr>();
       assert(denseAttr);
 
       for (auto element : denseAttr.getValues<Attribute>()) {
@@ -1003,12 +1046,13 @@ static std::string declareValue(Value value) {
              ";\n";
   }
 
-  if (dyn_cast<ShapedType>(value.getType()))
+  // if (dyn_cast<ShapedType>(value.getType())) // seems to be newer LLVM
+  if (value.getType().dyn_cast<ShapedType>())
     return getTypeName(value) + " " + getArrayInit(value) + ";\n";
   return getTypeName(value) + " " + getValueName(value) + ";\n";
 }
 
-static std::string emitOp(func::FuncOp funcOp) {
+static std::string emitOp(mlir::FuncOp funcOp) {
   // Pre-condition check
   checkFuncOp(funcOp);
 
@@ -1018,9 +1062,11 @@ static std::string emitOp(func::FuncOp funcOp) {
   // Emit input arguments.
   SmallVector<Value, 8> args;
   for (auto &arg : funcOp.getArguments()) {
-    if (!dyn_cast<ShapedType>(arg.getType()))
+    // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
+    if (!arg.getType().dyn_cast<ShapedType>())
       llvm_unreachable("Function arg has scalar type. This is not supported.");
-    auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg)
+    // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
+    auto argName = (arg.getType().dyn_cast<ShapedType>()) ? getArrayInit(arg)
                                                          : getValueName(arg);
     funcOpBuff += getTypeName(arg) + " " + argName + ",";
   }
@@ -1043,7 +1089,7 @@ static std::string emitOp(func::FuncOp funcOp) {
   return funcOpBuff;
 }
 
-static LogicalResult emitHLS(func::FuncOp funcOp, raw_ostream &os) {
+static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
   os << "// =====================================\n"
      << "//     Mase HLS Hardware\n"
      << "//     Model: " << funcOp.getName() << "\n"
@@ -1065,23 +1111,31 @@ static LogicalResult emitHLS(func::FuncOp funcOp, raw_ostream &os) {
 
 namespace {
 class EmitHLSPass : public phism::EmitHLSPassBase<EmitHLSPass> {
-
 public:
+
+  std::string fileName = "";
+  std::string hlsParam = "";
+
+  EmitHLSPass() = default;
+  EmitHLSPass(const EmitHLSPipelineOptions & options)
+    : fileName(!options.fileName.hasValue() ? "" : options.fileName.getValue()),
+      hlsParam(!options.hlsParam.hasValue() ? "" : options.hlsParam.getValue()) {
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    // Torch-mlir must only emit a single function as the top-level
-    // function.
+    // Torch-mlir must only emit a single function as the top-level function.
     auto i = 0;
-    m.walk([&](func::FuncOp op) { i++; });
+    m.walk([&](mlir::FuncOp op) { i++; });
     if (i != 1)
       m.emitError("Found more than one function in the module. Please "
                   "check which one for lowering.");
 
-    m.walk([&](func::FuncOp op) { initArgTypeMap(op, hlsParam); });
+    m.walk([&](mlir::FuncOp op) { initArgTypeMap(op, hlsParam); });
 
     std::error_code ec;
     llvm::raw_fd_ostream fout(fileName, ec);
-    for (auto funcOp : llvm::make_early_inc_range(m.getOps<func::FuncOp>())) {
+    for (auto funcOp : llvm::make_early_inc_range(m.getOps<mlir::FuncOp>())) {
       auto result = (fileName.empty()) ? emitHLS(funcOp, llvm::outs())
                                        : emitHLS(funcOp, fout);
       if (failed(result))
@@ -1091,8 +1145,16 @@ public:
 };
 } // namespace
 
-std::unique_ptr<Pass> phism::createEmitHLSPass() {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+phism::createEmitHLSPass() {
   return std::make_unique<EmitHLSPass>();
 }
 
-// TODO do I need register EmitHLSPass?
+void phism::registerEmitHLSPass() {
+  PassPipelineRegistration<EmitHLSPipelineOptions>(
+    "emit-hls", "Emit HLS code for the given program.",
+    [](OpPassManager &pm, const EmitHLSPipelineOptions &options) {
+      pm.addPass(std::make_unique<EmitHLSPass>(options));
+    }
+  );
+}

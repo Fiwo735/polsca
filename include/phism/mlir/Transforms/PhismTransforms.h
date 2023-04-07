@@ -14,6 +14,7 @@ void registerLoopTransformPasses();
 void registerFoldIfPasses();
 void registerAllPhismPasses();
 // void registerDependenceAnalysisPasses();
+void registerEmitHLSPass();
 } // namespace phism
 
 #endif

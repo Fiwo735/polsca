@@ -13,6 +13,7 @@ add_mlir_library(PhismTransforms
   LiftMemRefSubview.cc
   SCoPDecomposition.cc
   LoadSwitch.cc
+  EmitHLS.cc
   Utils.cc
 
   ADDITIONAL_HEADER_DIRS
@@ -31,4 +32,9 @@ add_mlir_library(PhismTransforms
   MLIRStandard
   MLIRSupport
   MLIRAffineToStandard
+  MLIRLinalgAnalysis
+  MLIRLinalg
+  MLIRLinalgTransforms
+  MLIRLinalgUtils
+  MLIRSCF
 )

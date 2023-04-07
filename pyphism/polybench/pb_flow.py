@@ -101,7 +101,7 @@ class PbFlowOptions(PhismRunnerOptions):
     skip_vitis: bool = False
     skip_csim: bool = False  # Given cosim = True, you can still turn down csim.
     sanity_check: bool = False  # Run pb-flow in sanity check mode
-    emit_HLS: bool = False # Raise to C/C++ HLS instead of using LLVM IR for running Vitis HLS
+    emit_hls: bool = False # Raise to C/C++ HLS instead of using LLVM IR for running Vitis HLS
 
     array_partition_v2: bool = False  # Use the newer array partition (TODO: migrate)
 
@@ -912,7 +912,7 @@ class PbFlow(PhismRunner):
             ##### C/C++                 #####################
             .write_tb_tcl_for_C()
             
-        ) if self.options.emit_HLS else (
+        ) if self.options.emit_hls else (
             # Use Vitis HLS to process LLVM IR directly (omitting HLS C/C++) and generate TCL for LLVM IR
             self.lower_scf()            # 6.
             .lower_llvm()               # 6.
@@ -924,7 +924,7 @@ class PbFlow(PhismRunner):
     def emit_HLS(self):
         """Run Phism emit HLS."""
         # 1 TODO pass for emitting C/C++, instead of vitis_opt and write_tb_tcl_by_llvm
-        if not self.options.emit_HLS:
+        if not self.options.emit_hls:
             return self
 
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
@@ -932,12 +932,10 @@ class PbFlow(PhismRunner):
         )
         log_file = self.cur_file.replace(".cpp", ".log")
 
-        # TODO why -emit-HLS is not recognized?
         args = [
             self.get_program_abspath("phism-opt"),
             src_file,
-            f'-emit-HLS',
-            # "-canonicalize", # TODO is canonicalize needed here?
+            f'-emit-hls',
             "-debug-only=emit-hls",
         ]
 
@@ -959,16 +957,14 @@ class PbFlow(PhismRunner):
         src_base = os.path.basename(src_file)
         work_dir = self.work_dir
         top_func = get_top_func(src_file)
-        # TODO what is pb_dataset?
-        pb_dataset = ""
-        # TODO what is config?
+        pb_dataset = self.options.dataset
+        # Not needed for now
         tcl_config = ""
 
         # TODO tbgen.tcl could become a self. attribute
         phism_vitis_tcl = os.path.join(base_dir, "tbgen.tcl")
 
         # Write the TCL for Phism.
-        # TODO why was the old .tcl generated via other programs instead of directly?
         with open(phism_vitis_tcl, "w") as f:
             f.write(
                 TBGEN_VITIS_TCL.format(

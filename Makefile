@@ -20,7 +20,7 @@ test-example:
 	python3 scripts/pb-flow.py ./example/polybench -e $(example) --work-dir ./tmp/phism/pb-flow.tmp --cosim
 
 test-emit:
-	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-HLS
+	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls
 
 # Evaluate polybench (baseline) - need to be used in environment
 test-polybench:

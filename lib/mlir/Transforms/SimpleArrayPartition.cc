@@ -43,12 +43,15 @@ namespace {
 struct ArrayPartitionPipelineOptions
     : public mlir::PassPipelineOptions<ArrayPartitionPipelineOptions> {
   Option<bool> dumpFile{
-      *this, "dumpFile",
-      llvm::cl::desc("Enable dumping the tile info into a file."),
-      llvm::cl::init(false)};
-  Option<bool> flatten{*this, "flatten",
-                       llvm::cl::desc("Enable flattening the partition dims."),
-                       llvm::cl::init(false)};
+    *this, "dumpFile",
+    llvm::cl::desc("Enable dumping the tile info into a file."),
+    llvm::cl::init(false)
+  };
+  Option<bool> flatten{
+    *this, "flatten",
+    llvm::cl::desc("Enable flattening the partition dims."),
+    llvm::cl::init(false)
+  };
 };
 } // namespace
 

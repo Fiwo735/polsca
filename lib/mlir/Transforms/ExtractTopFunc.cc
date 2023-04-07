@@ -42,10 +42,14 @@ static constexpr const char *SCOP_CONSTANT_VALUE = "scop.constant_value";
 
 namespace {
 struct PipelineOptions : public mlir::PassPipelineOptions<PipelineOptions> {
-  Option<std::string> topFuncName{*this, "name",
-                                  llvm::cl::desc("Top function name")};
-  Option<bool> keepAll{*this, "keepall",
-                       llvm::cl::desc("Keep all the functions.")};
+  Option<std::string> topFuncName{
+    *this, "name",
+    llvm::cl::desc("Top function name")
+  };
+  Option<bool> keepAll{
+    *this, "keepall",
+    llvm::cl::desc("Keep all the functions.")
+  };
 };
 } // namespace
 

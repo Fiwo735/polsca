@@ -43,8 +43,10 @@ namespace {
 struct LoopTransformsPipelineOptions
     : public mlir::PassPipelineOptions<LoopTransformsPipelineOptions> {
 
-  Option<int> maxSpan{*this, "max-span",
-                      llvm::cl::desc("Maximum spanning of the point loop.")};
+  Option<int> maxSpan{
+    *this, "max-span",
+    llvm::cl::desc("Maximum spanning of the point loop.")
+  };
 };
 
 } // namespace

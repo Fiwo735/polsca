@@ -85,7 +85,7 @@ def main():
         "--diamond-tiling", action="store_true", help="Use diamond tiling"
     )
     parser.add_argument(
-        "--emit-HLS",
+        "--emit-hls",
         action="store_true",
         help="Raise MLIR to HLS C/C++",
     )

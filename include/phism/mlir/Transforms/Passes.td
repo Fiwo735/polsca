@@ -130,10 +130,16 @@ def InlineSCoPAffine : Pass<"inline-scop-affine", "::mlir::ModuleOp"> {
   ];
 }
 
-def EmitHLS : FunctionPass<"emit-HLS"> {
-  let summary = "Raise MLIR to HLS C/C++.";
+def EmitHLSPass : Pass<"emit-hls", "::mlir::ModuleOp"> {
+  let summary = "Emit HLS code from MLIR";
+  let description = [{ 
+    Emit HLS code for the given program. It could be either default implementation of traditional HLS hardware,
+    or a dataflow architecture by bufferizing the inputs and outputs.
+  }];
   let constructor = "phism::createEmitHLSPass()";
   let options = [
+    Option<"fileName", "file-name", "std::string", /*default=*/"", "The output HLS code">,
+    Option<"hlsParam", "hls-param", "std::string", /*default=*/"", "The HLS parameters for quantization">
   ];
 }
 

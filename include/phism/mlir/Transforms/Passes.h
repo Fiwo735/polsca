@@ -24,7 +24,6 @@ std::unique_ptr<mlir::OperationPass<mlir::FuncOp>> createLoadSwitchPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLiftMemRefSubviewPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createSCoPDecompositionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createInlineSCoPAffinePass();
-// TODO ModuleOp, FuncOp or just Pass?
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createEmitHLSPass();
 
 /// Generate the code for registering passes.
