@@ -62,21 +62,20 @@ static llvm::DenseMap<Block *, std::string> blockMap;
 //  formats.
 // ------------------------------------------------------
 
-// TODO is this needed?
 namespace {
 struct EmitHLSPipelineOptions : public mlir::PassPipelineOptions<EmitHLSPipelineOptions> {
   Option<std::string> fileName{
-    *this, "filename",
+    *this, "file-name",
     llvm::cl::desc("The output HLS code")
   };
   Option<std::string> hlsParam{
-    *this, "hlsparam",
+    *this, "hls-param",
     llvm::cl::desc("The HLS parameters for quantization")
   };
 };
 } // namespace
 
-static std::string globalType;
+static std::string globalType = "";
 // Unit/Element type of a value
 static llvm::DenseMap<Value, std::string> unitTypeMap;
 
@@ -200,8 +199,10 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
   LLVM_DEBUG(dbgs() << funcOp.getName() << " : " << hlsParam << "\n");
 
   auto types = parseHlsParam(hlsParam);
+  unsigned args_no_hls_type_count = funcOp.getArguments().size() - types.size();
 
   for (auto &arg : funcOp.getArguments()) {
+    LLVM_DEBUG(dbgs() << "arg: " << arg << " : " << arg.getType() << "\n");
     // auto arrayType = dyn_cast<ShapedType>(arg.getType());
     auto arrayType = arg.getType().dyn_cast<ShapedType>();
     if (!arrayType)
@@ -236,8 +237,31 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
         break;
       }
     }
-    assert(unitTypeMap.count(arg) &&
-           "Cannot find arg with the same shape in the input HLS parameters.");
+
+    // HLS type not found in the parsed HLS types so use default one
+    if (unitTypeMap.count(arg) == 0) {
+      if (args_no_hls_type_count > 0) {
+        LLVM_DEBUG(dbgs() << "arg " << arg << ": " << arg.getType() << 
+          " did not match any parsed HLS type, so using default type\n");
+
+        std::string default_type = "ap_fixed";
+        unsigned default_total_precision = 8;
+        unsigned default_int_precision = 5;
+
+        unitTypeMap[arg] = default_type + "<" + std::to_string(default_total_precision)
+                          + ", " + std::to_string(default_int_precision) + ">";
+
+        args_no_hls_type_count--;
+      } else {
+        llvm_unreachable("Cannot find arg with the same shape in the input HLS parameters.");
+      }
+    }
+
+  }
+  // If none of the arguments explicitly set the global type then fall back to last arg
+  if (globalType == "") {
+    LLVM_DEBUG(dbgs() << "globalType not set, so using default type\n");
+    globalType = unitTypeMap[funcOp.getArguments().back()];
   }
   assert(types.empty());
 }
@@ -556,7 +580,7 @@ static std::string emitOp(scf::ForOp forOp) {
   return "for (" + getTypeName(iter) + " " + iterName + " = " +
          getValueName(lowerBound) + "; " + iterName + " < " +
          getValueName(upperBound) + "; " + iterName +
-         " += " + getValueName(step) + ") {" + emitBlock(*forOp.getBody()) +
+         " += " + getValueName(step) + ") {\n" + emitBlock(*forOp.getBody()) +
          "}\n";
 }
 
@@ -625,7 +649,7 @@ static std::string emitOp(AffineForOp affineForOp) {
 
   return "for (" + getTypeName(iter) + " " + iterName + " = " + lowerBound +
          "; " + iterName + " < " + upperBound + "; " + iterName +
-         " += " + std::to_string(step) + ") {" +
+         " += " + std::to_string(step) + ") {\n" +
          emitBlock(*affineForOp.getBody()) + "}\n";
 }
 
@@ -1091,7 +1115,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
 
 static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
   os << "// =====================================\n"
-     << "//     Mase HLS Hardware\n"
+     << "//     Emit HLS Hardware\n"
      << "//     Model: " << funcOp.getName() << "\n"
      << "// =====================================\n"
      << "#include <algorithm>\n"

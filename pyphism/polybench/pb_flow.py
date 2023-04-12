@@ -980,13 +980,16 @@ class PbFlow(PhismRunner):
         return self
 
     def check_if_systolic_array_possible(self):
-        return False
+        return True
 
     def post_poly(self):
         return (
             # Systolic array possible so use corresponding transforms
-            self.sanity_check()
+            self.sanity_check() #
             .systolic_array_transform()
+            # .systolic_array_transform2()
+            # .systolic_array_transform3()
+            # .systolic_array_transform4()
             .sanity_check(no_diff=True)
 
         ) if self.check_if_systolic_array_possible() else (
@@ -1003,6 +1006,7 @@ class PbFlow(PhismRunner):
         )
 
     def systolic_array_transform(self):
+        return self #TODO early exit for now
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
             ".mlir", ".sa.mlir"
         )
