@@ -88,6 +88,32 @@ public:
   std::vector<long int> precision;
 };
 
+// Indent handler
+class Indent {
+public:
+  Indent(): indent_level(0) {}
+
+  void add() {
+    indent_level += 2;
+  }
+
+  void sub() {
+    indent_level -= 2;
+  }
+
+  std::string operator()() const {
+    return std::string(indent_level, indent_char);
+  }
+
+  size_t get_level() const {
+    return indent_level;
+  }
+
+private:
+  size_t indent_level = 0;
+  char indent_char = ' ';
+} indent;
+
 static bool isNumberString(std::string s) {
   std::string::const_iterator it = s.begin();
   while (it != s.end() && std::isdigit(*it))
@@ -195,6 +221,41 @@ static std::vector<QArgType *> parseHlsParam(std::string param) {
   return types;
 }
 
+template<class UnaryPred>
+static void updateUnitTypeAndValueMap(std::vector<QArgType *> &types,
+                                      const Value arg, UnaryPred predicate) {
+  for (auto type : types) {
+    if (predicate(type)) {
+      if (type->type == "ap_fixed") {
+        assert(type->precision.size() == 2 &&
+              "Function arg has ap_fixed type but has more than 2 precision "
+              "constraints.");
+        assert(
+            type->precision[0] >= type->precision[1] &&
+            "Function arg has ap_fixed type but total width is smaller than "
+            "the fraction width.");
+
+        unitTypeMap[arg] = type->type + "<" +
+                          std::to_string(type->precision[0]) + ", " +
+                          std::to_string(type->precision[1]) + ">";
+      } else
+        llvm_unreachable("Unsupported data type for the function arguments.");
+
+      if (!type->isInput)
+        globalType = unitTypeMap[arg];
+
+      if (valueMap.count(arg) == 0)
+        valueMap[arg] = type->name;
+      else
+        llvm_unreachable("HLS param tries to overwrite an already defined variable.");
+
+      // Assuming that the types are in-order
+      types.erase(std::find(types.begin(), types.end(), type));
+      break;
+    }
+  }
+}
+
 static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
   LLVM_DEBUG(dbgs() << funcOp.getName() << " : " << hlsParam << "\n");
 
@@ -202,40 +263,24 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
   unsigned args_no_hls_type_count = funcOp.getArguments().size() - types.size();
 
   for (auto &arg : funcOp.getArguments()) {
-    LLVM_DEBUG(dbgs() << "arg: " << arg << " : " << arg.getType() << "\n");
-    // auto arrayType = dyn_cast<ShapedType>(arg.getType());
-    auto arrayType = arg.getType().dyn_cast<ShapedType>();
-    if (!arrayType)
-      llvm_unreachable("Function arg has scalar type. This is not supported.");
-    if (!arrayType.hasStaticShape())
-      llvm_unreachable(
-          "Function arg contains dynamic shape. This is not supported.");
+    // Array
+    if (auto arrayType = arg.getType().dyn_cast<ShapedType>()) {
+      LLVM_DEBUG(dbgs() << "array arg: " << arg << " : " << arg.getType() << "\n");
+      if (!arrayType.hasStaticShape())
+        llvm_unreachable(
+            "Function arg contains dynamic shape. This is not supported.");
 
-    for (auto type : types) {
       std::vector<long int> arrayShape = arrayType.getShape().vec();
-      if (areVecSame<long int>(type->shape, arrayShape)) {
-        if (type->type == "ap_fixed") {
-          assert(type->precision.size() == 2 &&
-                 "Function arg has ap_fixed type but has more than 2 precision "
-                 "constraints.");
-          assert(
-              type->precision[0] >= type->precision[1] &&
-              "Function arg has ap_fixed type but total width is smaller than "
-              "the fraction width.");
+      updateUnitTypeAndValueMap(
+        types, arg, [&arrayShape](QArgType *type) {
+          return areVecSame<long int>(type->shape, arrayShape); });
 
-          unitTypeMap[arg] = type->type + "<" +
-                             std::to_string(type->precision[0]) + ", " +
-                             std::to_string(type->precision[1]) + ">";
-        } else
-          llvm_unreachable("Unsupported data type for the function arguments.");
-
-        if (!type->isInput)
-          globalType = unitTypeMap[arg];
-
-        // Assuming that the types are in-order
-        types.erase(std::find(types.begin(), types.end(), type));
-        break;
-      }
+    // Scalar
+    } else {
+      LLVM_DEBUG(dbgs() << "scalar arg: " << arg << " : " << arg.getType() << "\n");
+      // llvm_unreachable("Function arg has scalar type. This is not supported.");
+      updateUnitTypeAndValueMap(
+        types, arg, [](QArgType *type) {return true; });
     }
 
     // HLS type not found in the parsed HLS types so use default one
@@ -256,12 +301,11 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
         llvm_unreachable("Cannot find arg with the same shape in the input HLS parameters.");
       }
     }
-
   }
   // If none of the arguments explicitly set the global type then fall back to last arg
   if (globalType == "") {
-    LLVM_DEBUG(dbgs() << "globalType not set, so using default type\n");
     globalType = unitTypeMap[funcOp.getArguments().back()];
+    LLVM_DEBUG(dbgs() << "globalType not set, so using default type: " << globalType << "\n");
   }
   assert(types.empty());
 }
@@ -367,31 +411,31 @@ static std::string getArrayInit(Value array) {
 // ------------------------------------------------------
 
 static std::string emitBinaryOp(Operation *op, std::string symbol) {
-  return getValueName(op->getResult(0)) + " = " +
+  return indent() + getValueName(op->getResult(0)) + " = " +
          getValueName(op->getOperand(0)) + " " + symbol + " " +
          getValueName(op->getOperand(1)) + ";\n";
 }
 
 static std::string emitBinaryFunc(Operation *op, std::string symbol) {
-  return getValueName(op->getResult(0)) + " = " + symbol + "(" +
+  return indent() + getValueName(op->getResult(0)) + " = " + symbol + "(" +
          getValueName(op->getOperand(0)) + ", " +
          getValueName(op->getOperand(1)) + ");\n";
 }
 
 static std::string emitUnaryOp(Operation *op, std::string symbol) {
-  return getValueName(op->getResult(0)) + " = " + symbol + "(";
-  getValueName(op->getOperand(0)) + ");\n";
+  return indent() + getValueName(op->getResult(0)) + " = " + symbol + "(" +
+         getValueName(op->getOperand(0)) + ");\n";
 }
 
 static std::string emitAssignOp(Operation *op) {
-  return getValueName(op->getResult(0)) + " = " +
+  return indent() + getValueName(op->getResult(0)) + " = " +
          getValueName(op->getOperand(0)) + ";\n";
 }
 
 class AffineExprPrinter : public AffineExprVisitor<AffineExprPrinter> {
 public:
   explicit AffineExprPrinter(unsigned numDim, Operation::operand_range operands)
-      : numDim(numDim), operands(operands) {}
+      : numDim(numDim), operands(operands) {buff = indent();}
 
   void visitAddExpr(AffineBinaryOpExpr expr) { visitAffineBinary(expr, "+"); }
   void visitMulExpr(AffineBinaryOpExpr expr) { visitAffineBinary(expr, "*"); }
@@ -462,7 +506,7 @@ private:
 
 template <typename OpType>
 static std::string emitAffineMaxMinOp(OpType op, std::string symbol) {
-  std::string affineMaxMinBuff = getValueName(op.getResult()) + " = ";
+  std::string affineMaxMinBuff = indent() + getValueName(op.getResult()) + " = ";
   auto affineMap = op.getAffineMap();
   AffineExprPrinter affineMapPrinter(affineMap.getNumDims(), op.getOperands());
   for (unsigned i = 0, e = affineMap.getNumResults() - 1; i < e; ++i)
@@ -478,7 +522,7 @@ static std::string emitAffineMaxMinOp(OpType op, std::string symbol) {
 // ------------------------------------------------------
 
 static std::string emitOp(memref::LoadOp loadOp) {
-  std::string loadBuff = getValueName(loadOp.getResult()) + " = " +
+  std::string loadBuff = indent() + getValueName(loadOp.getResult()) + " = " +
                          getValueName(loadOp.getMemRef());
   for (auto index : loadOp.getIndices())
     loadBuff += "[" + getValueName(index) + "]";
@@ -488,7 +532,7 @@ static std::string emitOp(memref::LoadOp loadOp) {
 }
 
 static std::string emitOp(memref::StoreOp storeOp) {
-  std::string storeBuff = getValueName(storeOp.getMemRef());
+  std::string storeBuff = indent() + getValueName(storeOp.getMemRef());
   for (auto index : storeOp.getIndices())
     storeBuff += "[" + getValueName(index) + "]";
   storeBuff += " = " + getValueName(storeOp.getValueToStore()) + ";\n";
@@ -497,7 +541,7 @@ static std::string emitOp(memref::StoreOp storeOp) {
 
 static std::string emitOp(memref::CopyOp copyOp) {
   auto type = copyOp.getTarget().getType().cast<MemRefType>();
-  return "memcpy(" + getValueName(copyOp.getTarget()) + ", " +
+  return indent() + "memcpy(" + getValueName(copyOp.getTarget()) + ", " +
          getValueName(copyOp.getSource()) + ", " +
          std::to_string(type.getNumElements()) + " * sizeof(" +
          getTypeName(copyOp.getTarget()) + "));\n";
@@ -505,7 +549,7 @@ static std::string emitOp(memref::CopyOp copyOp) {
 
 // static std::string emitOp(arith::SelectOp selectOp) { // SelectOp seems to belong to mlir:: in this LLVM version
 static std::string emitOp(mlir::SelectOp selectOp) {
-  return getValueName(selectOp.getResult()) + " = " +
+  return indent() + getValueName(selectOp.getResult()) + " = " +
          getValueName(selectOp.getCondition()) + " ? " +
          getValueName(selectOp.getTrueValue()) + " : " +
          getValueName(selectOp.getFalseValue()) + ";\n";
@@ -577,7 +621,7 @@ static std::string emitOp(scf::ForOp forOp) {
   // auto step = forOp.getStep(); // used in newer LLVM
   auto step = forOp.step();
 
-  return "for (" + getTypeName(iter) + " " + iterName + " = " +
+  return indent() + "for (" + getTypeName(iter) + " " + iterName + " = " +
          getValueName(lowerBound) + "; " + iterName + " < " +
          getValueName(upperBound) + "; " + iterName +
          " += " + getValueName(step) + ") {\n" + emitBlock(*forOp.getBody()) +
@@ -589,7 +633,7 @@ static std::string emitOp(scf::IfOp ifOp) {
   auto cond = ifOp.condition();
   std::string ifBuff;
 
-  ifBuff = "if (" + getValueName(cond) + ") {" +
+  ifBuff = indent() + "if (" + getValueName(cond) + ") {" +
           //  emitBlock(ifOp.getThenRegion().front()); // used in newer LLVM
            emitBlock(ifOp.thenRegion().front());
   // if (!ifOp.getElseRegion().empty()) { // used in newer LLVM
@@ -609,7 +653,7 @@ static std::string emitOp(scf::YieldOp yieldOp) {
   auto resultIdx = 0;
   std::string yieldBuff;
   for (auto result : yieldOp->getParentOp()->getResults())
-    yieldBuff += getValueName(result) + " = " +
+    yieldBuff += indent() + getValueName(result) + " = " +
                  getValueName(yieldOp.getOperand(resultIdx++)) + ";\n";
   return yieldBuff;
 }
@@ -647,17 +691,21 @@ static std::string emitOp(AffineForOp affineForOp) {
       upperBound += ", " + upperBoundPrinter.getAffineExpr(expr) + ")";
   }
 
-  return "for (" + getTypeName(iter) + " " + iterName + " = " + lowerBound +
-         "; " + iterName + " < " + upperBound + "; " + iterName +
+  // TODO This should happen implictly if iter was IndexType instead of BlockArgument
+  unitTypeMap[iter] = "int";
+  LLVM_DEBUG(dbgs() << "getTypeName(iter): " << getTypeName(iter) << "\n");
+
+  return indent() + "for (" + getTypeName(iter) + " " + iterName + " = " +
+         lowerBound + "; " + iterName + " < " + upperBound + "; " + iterName +
          " += " + std::to_string(step) + ") {\n" +
-         emitBlock(*affineForOp.getBody()) + "}\n";
+         emitBlock(*affineForOp.getBody()) + indent() + "}\n";
 }
 
 static std::string emitOp(AffineIfOp affineIfOp) {
   auto constrSet = affineIfOp.getIntegerSet();
   AffineExprPrinter constrPrinter(constrSet.getNumDims(),
                                   affineIfOp.getOperands());
-  std::string affineIfBuff = "if (";
+  std::string affineIfBuff = indent() + "if (";
   unsigned constrIdx = 0;
   for (auto &expr : constrSet.getConstraints()) {
     affineIfBuff += constrPrinter.getAffineExpr(expr);
@@ -677,7 +725,7 @@ static std::string emitOp(AffineIfOp affineIfOp) {
 }
 
 static std::string emitOp(AffineLoadOp affineLoadOp) {
-  std::string affineLoadBuff = getValueName(affineLoadOp.getResult()) + " = " +
+  std::string affineLoadBuff = indent() + getValueName(affineLoadOp.getResult()) + " = " +
                                getValueName(affineLoadOp.getMemRef());
   auto affineMap = affineLoadOp.getAffineMap();
   AffineExprPrinter affineMapPrinter(affineMap.getNumDims(),
@@ -688,7 +736,7 @@ static std::string emitOp(AffineLoadOp affineLoadOp) {
 }
 
 static std::string emitOp(AffineStoreOp affineStoreOp) {
-  std::string affineStoreBuff = getValueName(affineStoreOp.getMemRef());
+  std::string affineStoreBuff = indent() + getValueName(affineStoreOp.getMemRef());
   auto affineMap = affineStoreOp.getAffineMap();
   AffineExprPrinter affineMapPrinter(affineMap.getNumDims(),
                                      affineStoreOp.getMapOperands());
@@ -706,7 +754,7 @@ static std::string emitOp(AffineYieldOp affineYieldOp) {
   unsigned resultIdx = 0;
   std::string yieldBuff;
   for (auto result : affineYieldOp->getParentOp()->getResults())
-    yieldBuff += getValueName(result) + " = " +
+    yieldBuff += indent() + getValueName(result) + " = " +
                  getValueName(affineYieldOp.getOperand(resultIdx++)) + ";\n";
   return yieldBuff;
 }
@@ -716,7 +764,8 @@ static std::string emitOp(AffineYieldOp affineYieldOp) {
 // ------------------------------------------------------
 
 static std::string emitBlock(Block &block) {
-  std::string blockBuff = getBlockName(&block) + ":\n";
+  indent.add();
+  std::string blockBuff = indent() + getBlockName(&block) + ":\n";
 
   for (auto &op : block) {
 
@@ -1007,6 +1056,7 @@ static std::string emitBlock(Block &block) {
 
     op.emitError(" is not supported yet.");
   }
+  indent.sub();
   return blockBuff;
 }
 
@@ -1050,7 +1100,7 @@ static std::string declareValue(Value value) {
   if (auto constantOp = dyn_cast<arith::ConstantOp>(value.getDefiningOp())) {
     // if (dyn_cast<ShapedType>(type)) { // seems to be newer LLVM
     if (type.dyn_cast<ShapedType>()) {
-      valueBuff += getTypeName(value) + " " + getArrayInit(value) + " = {";
+      valueBuff += indent() + getTypeName(value) + " " + getArrayInit(value) + " = {";
 
       // auto denseAttr = dyn_cast<DenseElementsAttr>(constantOp.getValue()); // seems to be newer LLVM
       auto denseAttr = constantOp.getValue().dyn_cast<DenseElementsAttr>();
@@ -1065,15 +1115,15 @@ static std::string declareValue(Value value) {
       valueBuff += "};\n";
       return valueBuff;
     } else
-      return getTypeName(value) + " " + getValueName(value) + " = " +
+      return indent() + getTypeName(value) + " " + getValueName(value) + " = " +
              getConstantOperand(constantOp.getType(), constantOp.getValue()) +
              ";\n";
   }
 
   // if (dyn_cast<ShapedType>(value.getType())) // seems to be newer LLVM
   if (value.getType().dyn_cast<ShapedType>())
-    return getTypeName(value) + " " + getArrayInit(value) + ";\n";
-  return getTypeName(value) + " " + getValueName(value) + ";\n";
+    return indent() + getTypeName(value) + " " + getArrayInit(value) + ";\n";
+  return indent() + getTypeName(value) + " " + getValueName(value) + ";\n";
 }
 
 static std::string emitOp(mlir::FuncOp funcOp) {
@@ -1081,23 +1131,26 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   checkFuncOp(funcOp);
 
   // Emit function prototype
-  std::string funcOpBuff = "void " + funcOp.getName().str() + "(";
+  assert(indent.get_level() == 0 && "No indent is expected for function definition");
+  std::string funcOpBuff = indent() + "void " + funcOp.getName().str() + "(";
 
   // Emit input arguments.
   SmallVector<Value, 8> args;
   for (auto &arg : funcOp.getArguments()) {
     // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
-    if (!arg.getType().dyn_cast<ShapedType>())
-      llvm_unreachable("Function arg has scalar type. This is not supported.");
+    // if (!arg.getType().dyn_cast<ShapedType>())
+    //   llvm_unreachable("Function arg has scalar type. This is not supported.");
     // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
     auto argName = (arg.getType().dyn_cast<ShapedType>()) ? getArrayInit(arg)
                                                          : getValueName(arg);
-    funcOpBuff += getTypeName(arg) + " " + argName + ",";
+    funcOpBuff += getTypeName(arg) + " " + argName + ", ";
   }
-  // Get rid of the last comma
+  // Get rid of the last comma and space
+  funcOpBuff.pop_back();
   funcOpBuff.pop_back();
   funcOpBuff += ") {\n";
 
+  indent.add();
   // Collect all the local variables
   funcOp.walk([&](Operation *op) {
     for (auto result : op->getResults()) {
@@ -1106,6 +1159,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
       funcOpBuff += declareValue(result);
     }
   });
+  indent.sub();
 
   // Emit funcOption body.
   funcOpBuff += emitBlock(funcOp.front());
