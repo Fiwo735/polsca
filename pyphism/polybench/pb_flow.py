@@ -1006,7 +1006,6 @@ class PbFlow(PhismRunner):
         )
 
     def systolic_array_transform(self):
-        return self #TODO early exit for now
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
             ".mlir", ".sa.mlir"
         )
@@ -1015,10 +1014,11 @@ class PbFlow(PhismRunner):
         # 3 TODO implement a dummy pass in SystolicArray.cc
         # 4 TODO understand the differences in AutoSA generated C code and Polsca to implement a proper transform
         args = [
-            # phism-opt --lower-to-sa xx.mlir
+            self.get_program_abspath("phism-opt"),
+            src_file,
+            f'-systolic-array',
+            "-debug-only=systolic-array",
         ]
-
-        args = self.filter_disabled(args)
 
         self.run_command(
             cmd=" ".join(args),
