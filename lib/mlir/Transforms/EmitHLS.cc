@@ -330,8 +330,8 @@ static std::string getBlockName(Block *block) {
 
 static std::string getTypeName(Value value) {
   // if (dyn_cast<BlockArgument>(value)) // seems to be newer LLVM version
-  if (value.dyn_cast<BlockArgument>())
-    return unitTypeMap[value];
+  // if (value.dyn_cast<BlockArgument>())
+  //   return unitTypeMap[value];
 
   auto valueType = value.getType();
   // if (auto arrayType = dyn_cast<ShapedType>(valueType))
@@ -759,6 +759,36 @@ static std::string emitOp(AffineYieldOp affineYieldOp) {
   return yieldBuff;
 }
 
+static std::string emitOp(mlir::CallOp callOp) {
+  std::string callOpBuff = "";
+
+  // Emit the function call
+  callOpBuff += indent() + callOp.getCallee().str() + "(";
+
+  // Emit input arguments
+  for (auto arg : callOp.getOperands()) {
+    auto argName = getValueName(arg);
+    callOpBuff += argName + ", ";
+  }
+
+  // Emit output arguments
+  for (auto result : callOp.getResults()) {
+    // Pass address for scalar result arguments
+    if (!result.getType().isa<ShapedType>())
+      callOpBuff += "&";
+
+    callOpBuff += getValueName(result) + ", ";
+  }
+
+  // Get rid of the last comma and space
+  callOpBuff.pop_back();
+  callOpBuff.pop_back();
+
+  callOpBuff += ");\n";
+
+  return callOpBuff;
+}
+
 // ------------------------------------------------------
 //   Enumerate ops
 // ------------------------------------------------------
@@ -1049,6 +1079,11 @@ static std::string emitBlock(Block &block) {
       continue;
     }
 
+    if (auto castOp = dyn_cast<mlir::CallOp>(op)) {
+      blockBuff += emitOp(castOp);
+      continue;
+    }
+
     // A pre-condition for this pass is that the function must not have return
     // value.
     if (auto castOp = dyn_cast<mlir::ReturnOp>(op))
@@ -1135,7 +1170,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   std::string funcOpBuff = indent() + "void " + funcOp.getName().str() + "(";
 
   // Emit input arguments.
-  SmallVector<Value, 8> args;
+  // SmallVector<Value, 8> args;
   for (auto &arg : funcOp.getArguments()) {
     // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
     // if (!arg.getType().dyn_cast<ShapedType>())
