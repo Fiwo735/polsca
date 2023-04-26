@@ -1,4 +1,4 @@
-//===- SystolicArray.cc ----------------------------------------------------===//
+//===- SystolicArrayTimeLoop.cc ----------------------------------------------------===//
 //
 // This file implements passes that TODO
 //
@@ -38,15 +38,15 @@ using namespace mlir;
 using namespace llvm;
 using namespace phism;
 
-#define DEBUG_TYPE "systolic-array"
+#define DEBUG_TYPE "systolic-array-time-loop"
 
 //----------------------------------------------------------------------------//
-// SystolicArrayPass:
+// SystolicArrayTimeLoopPass:
 // * TODO
 //----------------------------------------------------------------------------//
 
 namespace {
-struct SystolicArrayPipelineOptions : public mlir::PassPipelineOptions<SystolicArrayPipelineOptions> {
+struct SystolicArrayTimeLoopPipelineOptions : public mlir::PassPipelineOptions<SystolicArrayTimeLoopPipelineOptions> {
   Option<std::string> fileName{
     *this, "file-name",
     llvm::cl::desc("The output HLS code")
@@ -90,35 +90,69 @@ static int countSubstring(std::string pat, std::string txt) {
   return res;
 }
 
+static mlir::FuncOp createPE(AffineForOp affine_for_op) {
+  LLVM_DEBUG(dbgs() << "op name to create PE from: " << affine_for_op << "\n");
+
+  // mlir::FuncOp PE_func_op = mlir::FuncOp
+
+  // return PE_func_op
+}
+
+template <typename OpType>
+static bool contains(Block &block) {
+  for (auto &op : block) {
+    if (dyn_cast<OpType>(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 
 namespace {
-class SystolicArrayPass : public phism::SystolicArrayPassBase<SystolicArrayPass> {
+class SystolicArrayTimeLoopPass : public phism::SystolicArrayTimeLoopPassBase<SystolicArrayTimeLoopPass> {
 public:
 
   std::string fileName = "";
 
-  SystolicArrayPass() = default;
-  SystolicArrayPass(const SystolicArrayPipelineOptions & options)
+  SystolicArrayTimeLoopPass() = default;
+  SystolicArrayTimeLoopPass(const SystolicArrayTimeLoopPipelineOptions & options)
     : fileName(!options.fileName.hasValue() ? "" : options.fileName.getValue()){
   }
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    //TODO
+
+    SmallVector<mlir::AffineForOp> to_create_PE;
+    m.walk([&](mlir::AffineForOp op) {
+      LLVM_DEBUG(dbgs() << "op name: " << op << "\n");
+      // TODO find a proper way of determining time loops from polyhedral analysis
+      bool contains_affine_for = contains<AffineForOp>(*op.getBody());
+      LLVM_DEBUG(dbgs() << "Op contains more AffineForOp inside?: " << contains_affine_for << "\n");
+      if (!contains_affine_for) {
+        to_create_PE.push_back(op);
+      }
+    });
+
+    for (mlir::AffineForOp op : to_create_PE) {
+      createPE(op);
+    }
+
+    
   }
 };
 } // namespace
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-phism::createSystolicArraySPass() {
-  return std::make_unique<SystolicArrayPass>();
+phism::createSystolicArrayTimeLoopPass() {
+  return std::make_unique<SystolicArrayTimeLoopPass>();
 }
 
-void phism::registerSystolicArrayPass() {
-  PassPipelineRegistration<SystolicArrayPipelineOptions>(
-    "systolic-array", "Systolic array TODO.",
-    [](OpPassManager &pm, const SystolicArrayPipelineOptions &options) {
-      pm.addPass(std::make_unique<SystolicArrayPass>(options));
+void phism::registerSystolicArrayTimeLoopPass() {
+  PassPipelineRegistration<SystolicArrayTimeLoopPipelineOptions>(
+    "systolic-array-time-loop", "Systolic array time loop TODO.",
+    [](OpPassManager &pm, const SystolicArrayTimeLoopPipelineOptions &options) {
+      pm.addPass(std::make_unique<SystolicArrayTimeLoopPass>(options));
     }
   );
 }

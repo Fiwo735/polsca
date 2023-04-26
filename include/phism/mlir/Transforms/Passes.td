@@ -143,12 +143,12 @@ def EmitHLSPass : Pass<"emit-hls", "::mlir::ModuleOp"> {
   ];
 }
 
-def SystolicArrayPass : Pass<"systolic-array", "::mlir::ModuleOp"> {
+def SystolicArrayTimeLoopPass : Pass<"systolic-array-time-loop", "::mlir::ModuleOp"> {
   let summary = "TODO";
   let description = [{ 
     TODO
   }];
-  let constructor = "phism::createSystolicArraySPass()";
+  let constructor = "phism::createSystolicArrayTimeLoopPass()";
   let options = [
     Option<"fileName", "file-name", "std::string", /*default=*/"", "The output code">
   ];

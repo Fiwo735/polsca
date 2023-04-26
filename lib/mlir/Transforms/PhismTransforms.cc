@@ -30,7 +30,7 @@ void registerAllPhismPasses() {
   registerInlineSCoPAffinePass();
   registerLoadSwitchPass();
   registerEmitHLSPass();
-  registerSystolicArrayPass();
+  registerSystolicArrayTimeLoopPass();
 }
 
 } // namespace phism

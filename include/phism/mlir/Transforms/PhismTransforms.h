@@ -15,7 +15,7 @@ void registerFoldIfPasses();
 void registerAllPhismPasses();
 // void registerDependenceAnalysisPasses();
 void registerEmitHLSPass();
-void registerSystolicArrayPass();
+void registerSystolicArrayTimeLoopPass();
 } // namespace phism
 
 #endif

@@ -14,7 +14,7 @@ add_mlir_library(PhismTransforms
   SCoPDecomposition.cc
   LoadSwitch.cc
   EmitHLS.cc
-  SystolicArray.cc
+  SystolicArrayTimeLoop.cc
   Utils.cc
 
   ADDITIONAL_HEADER_DIRS

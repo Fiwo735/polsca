@@ -930,7 +930,7 @@ class PbFlow(PhismRunner):
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
             ".mlir", ".cpp"
         )
-        log_file = self.cur_file.replace(".cpp", ".log")
+        log_file = self.cur_file.replace(".cpp", ".cpp.log")
 
         args = [
             self.get_program_abspath("phism-opt"),
@@ -985,12 +985,17 @@ class PbFlow(PhismRunner):
     def post_poly(self):
         return (
             # Systolic array possible so use corresponding transforms
-            self.sanity_check() #
-            .systolic_array_transform()
-            # .systolic_array_transform2()
-            # .systolic_array_transform3()
-            # .systolic_array_transform4()
+            self.sanity_check()
+            .constant_args()
+            .sanity_check()
+            .loop_transforms()
+            .sanity_check()
+            .array_partition()
             .sanity_check(no_diff=True)
+            .scop_stmt_inline()
+            .sanity_check(no_diff=True)
+            .systolic_array_time_loop_transform()
+            .sanity_check() #TODO diff or no diff?
 
         ) if self.check_if_systolic_array_possible() else (
             # Systolic array not possible so use default transforms
@@ -1005,19 +1010,17 @@ class PbFlow(PhismRunner):
             .sanity_check(no_diff=True)
         )
 
-    def systolic_array_transform(self):
+    def systolic_array_time_loop_transform(self):
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
-            ".mlir", ".sa.mlir"
+            ".mlir", ".sat.mlir"
         )
         log_file = self.cur_file.replace(".mlir", ".log")
 
-        # 3 TODO implement a dummy pass in SystolicArray.cc
-        # 4 TODO understand the differences in AutoSA generated C code and Polsca to implement a proper transform
         args = [
             self.get_program_abspath("phism-opt"),
             src_file,
-            f'-systolic-array',
-            "-debug-only=systolic-array",
+            f'-systolic-array-time-loop',
+            "-debug-only=systolic-array-time-loop",
         ]
 
         self.run_command(
@@ -1027,6 +1030,29 @@ class PbFlow(PhismRunner):
             stdout=open(self.cur_file, "w"),
             env=self.env,
         )
+
+        return self
+    
+    def systolic_array_space_loop_transform(self):
+        src_file, self.cur_file = self.cur_file, self.cur_file.replace(
+            ".mlir", ".sas.mlir"
+        )
+        log_file = self.cur_file.replace(".mlir", ".log")
+
+        # args = [
+        #     self.get_program_abspath("phism-opt"),
+        #     src_file,
+        #     f'-systolic-array',
+        #     "-debug-only=systolic-array",
+        # ]
+
+        # self.run_command(
+        #     cmd=" ".join(args),
+        #     shell=True,
+        #     stderr=open(log_file, "w"),
+        #     stdout=open(self.cur_file, "w"),
+        #     env=self.env,
+        # )
 
         return self
         
