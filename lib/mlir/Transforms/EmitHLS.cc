@@ -142,6 +142,10 @@ static std::vector<long int> parseVector(std::string param) {
   return vec;
 }
 
+static std::string pragmaGen(std::string pragma) {
+  return indent() + "#pragma HLS " + pragma + "\n";
+}
+
 template <typename OpType>
 static bool areVecSame(std::vector<OpType> &v1, std::vector<OpType> &v2) {
   if (v1.size() != v2.size())
@@ -315,8 +319,14 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
 // ------------------------------------------------------
 
 static std::string getValueName(Value value) {
-  if (valueMap.count(value) == 0)
-    valueMap[value] = "v" + std::to_string(valueID++);
+  if (valueMap.count(value) == 0) {
+    // TODO how to best implement it
+    // if (value.hasAttr("phism.hls_pragma.inline_off"))
+    if (false)
+      valueMap[value] = "v" + std::to_string(valueID++);
+    else
+      valueMap[value] = "v" + std::to_string(valueID++);
+  }
 
   return valueMap[value];
 }
@@ -347,7 +357,7 @@ static std::string getTypeName(Value value) {
 
   // if (isa<IndexType>(valueType)) // seems to be newer LLVM version
   if (valueType.isa<IndexType>())
-    return "int";
+    return "unsigned";
   // if (auto intType = dyn_cast<IntegerType>(valueType)) { // seems to be newer LLVM version
   if (auto intType = valueType.dyn_cast<IntegerType>()) {
     if (intType.getWidth() == 1)
@@ -692,7 +702,7 @@ static std::string emitOp(AffineForOp affineForOp) {
   }
 
   // TODO This should happen implictly if iter was IndexType instead of BlockArgument
-  unitTypeMap[iter] = "int";
+  // unitTypeMap[iter] = "int";
   LLVM_DEBUG(dbgs() << "getTypeName(iter): " << getTypeName(iter) << "\n");
 
   return indent() + "for (" + getTypeName(iter) + " " + iterName + " = " +
@@ -1170,13 +1180,14 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   std::string funcOpBuff = indent() + "void " + funcOp.getName().str() + "(";
 
   // Emit input arguments.
+  std::string argName;
   // SmallVector<Value, 8> args;
   for (auto &arg : funcOp.getArguments()) {
     // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
     // if (!arg.getType().dyn_cast<ShapedType>())
     //   llvm_unreachable("Function arg has scalar type. This is not supported.");
     // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
-    auto argName = (arg.getType().dyn_cast<ShapedType>()) ? getArrayInit(arg)
+    argName = (arg.getType().dyn_cast<ShapedType>()) ? getArrayInit(arg)
                                                          : getValueName(arg);
     funcOpBuff += getTypeName(arg) + " " + argName + ", ";
   }
@@ -1186,12 +1197,25 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   funcOpBuff += ") {\n";
 
   indent.add();
+
+  // Emit HLS pragmas
+  if (funcOp->hasAttr("phism.hls_pragma.inline_off")) {
+    funcOpBuff += pragmaGen("INLINE OFF");
+  }
+
+  // Emit module index for PE
+  if (funcOp->hasAttr("phism.pe"))
+    funcOpBuff += indent() + "unsigned p = " + argName + "; // module index\n";
+
   // Collect all the local variables
+  funcOpBuff += indent() + "/* Local variable declaration */\n";
   funcOp.walk([&](Operation *op) {
     for (auto result : op->getResults()) {
       if (valueMap.count(result) == 1)
         op->emitError(" has been declared.");
+
       funcOpBuff += declareValue(result);
+      funcOpBuff += pragmaGen("RESOURCE TODO");
     }
   });
   indent.sub();
@@ -1202,11 +1226,10 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   return funcOpBuff;
 }
 
-static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
+static void emitIncludes(raw_ostream &os) {
   os << "// =====================================\n"
      << "//     Emit HLS Hardware\n"
-     << "//     Model: " << funcOp.getName() << "\n"
-     << "// =====================================\n"
+     << "// =====================================\n\n"
      << "#include <algorithm>\n"
      << "#include <ap_axi_sdata.h>\n"
      << "#include <ap_fixed.h>\n"
@@ -1217,8 +1240,10 @@ static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
      << "#include <stdint.h>\n"
      << "#include <string.h>\n"
      << "using namespace std;\n\n";
+}
 
-  os << emitOp(funcOp);
+static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
+  os << emitOp(funcOp) << "\n\n";
   return success();
 }
 
@@ -1248,6 +1273,7 @@ public:
 
     std::error_code ec;
     llvm::raw_fd_ostream fout(fileName, ec);
+    fileName.empty() ? emitIncludes(llvm::outs()) : emitIncludes(fout);
     for (auto funcOp : llvm::make_early_inc_range(m.getOps<mlir::FuncOp>())) {
       auto result = (fileName.empty()) ? emitHLS(funcOp, llvm::outs())
                                        : emitHLS(funcOp, fout);

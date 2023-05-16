@@ -19,6 +19,7 @@
 // #include "mlir/Dialect/Linalg/IR/Linalg.h" // 4) not found -> seems to be not needed
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/BlockAndValueMapping.h"
 // #include "mlir/Dialect/SCF/IR/SCF.h" // 5) not found -> works when replaced by removing /IR/
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/IR/AffineExprVisitor.h"
@@ -90,23 +91,151 @@ static int countSubstring(std::string pat, std::string txt) {
   return res;
 }
 
-static mlir::FuncOp createPE(AffineForOp affine_for_op) {
-  LLVM_DEBUG(dbgs() << "op name to create PE from: " << affine_for_op << "\n");
+// TODO llvm::DenseMap?
+std::map<llvm::StringRef, mlir::FuncOp> PE_FuncOp_old_to_new_map;
 
-  // mlir::FuncOp PE_func_op = mlir::FuncOp
 
-  // return PE_func_op
+static void handleCallerPE(mlir::CallOp PE_call_op) {
+  LLVM_DEBUG({
+    dbgs() << " * CallOp to handle:\n";
+    PE_call_op.dump();
+  });
+
+  FuncOp newCallee = PE_FuncOp_old_to_new_map[PE_call_op.getCallee()];
+
+  OpBuilder b(PE_call_op.getContext());
+
+  // New caller argument types.
+  // SmallVector<Type> newArgTypes;
+  // for (auto arg : PE_call_op.getArgOperands()) {
+  //   LLVM_DEBUG(dbgs() << "arg: " << arg << ", arg.getType():" << arg.getType() << "\n");
+  //   newArgTypes.push_back(arg.getType());
+  // }
+  // newArgTypes.push_back(zeroConstant.getType());
+
+  SmallVector<Value> operands;
+  for (auto arg : PE_call_op.getOperands())
+    operands.push_back(arg);
+
+  Value some_constant = b.create<arith::ConstantIndexOp>(PE_call_op.getLoc(), 123);
+  // operands.push_back(some_constant);
+  // The above throws an error because of <<UNKNOWN SSA VALUE>>, so using below as a temporary solution:
+  operands.push_back(PE_call_op.getOperands()[1]);
+
+  b.setInsertionPointAfter(PE_call_op);
+  CallOp newCaller = b.create<CallOp>(
+    PE_call_op.getLoc(),
+    newCallee,
+    operands
+  );
+
+    // newFuncType,
+    // PE_call_op.getCalleeAttr(),
+    // PE_call_op.getResultTypes(),
+    // std::string(PE_call_op.getCallee()) + "_new",
+
+  // New caller function type.
+  // FunctionType newFuncType = b.getFunctionType(newArgTypes, PE_call_op->getResultTypes());
+  LLVM_DEBUG({
+    dbgs() << " * New caller created:\n";
+    newCaller.dump();
+  });
+
+  // Erase original CallOp
+  PE_call_op->erase();
+
+
 }
 
-template <typename OpType>
-static bool contains(Block &block) {
-  for (auto &op : block) {
-    if (dyn_cast<OpType>(op)) {
-      return true;
-    }
+static void handleCalleePE(mlir::FuncOp PE_func_op) {
+  LLVM_DEBUG({
+    dbgs() << " * FuncOp to handle:\n";
+    PE_func_op.dump();
+  });
+
+  OpBuilder b(PE_func_op.getContext());
+
+
+  // Add indexes to arguments and instantiate as local variables (e.g. for easier debug and monitoring)
+  // New callee argument types.
+  SmallVector<Type> newArgTypes;
+  for (auto arg : PE_func_op.getArguments()) {
+    newArgTypes.push_back(arg.getType());
   }
-  return false;
+  // TODO this is last argument and not first to avoid conflicts when changing order of argument usage,
+  // i.e. operations in blocks still refer to the old argument order
+  Value zeroConstant = b.create<arith::ConstantIndexOp>(PE_func_op.getLoc(), 0);
+  // TODO use setAttr to set name for EmitHLS (like idx etc) -> how to do it for a Value type
+  // zeroConstant.setAttr("phism.name.idx", b.getUnitAttr());
+  newArgTypes.push_back(zeroConstant.getType());
+  
+
+  // New callee function type.
+  FunctionType newFuncType = b.getFunctionType(newArgTypes, PE_func_op->getResultTypes());
+  b.setInsertionPointAfter(PE_func_op);
+  FuncOp newCallee = b.create<FuncOp>(
+    PE_func_op.getLoc(),
+    std::string(PE_func_op.getName()),
+    newFuncType
+  );
+
+  Block *entry = newCallee.addEntryBlock();
+  b.setInsertionPointToEnd(entry);
+  b.create<mlir::ReturnOp>(PE_func_op.getLoc());
+  LLVM_DEBUG({
+    dbgs() << " * New callee created (body empty):\n";
+    newCallee.dump();
+  });
+
+  // Argument map.
+  BlockAndValueMapping vmap;
+  vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
+
+  // Iterate every operation in the original callee and clone it to the new one.
+  b.setInsertionPointToStart(entry);
+  for (Operation &op : PE_func_op.getBlocks().begin()->getOperations()) {
+    if (isa<mlir::ReturnOp>(op))
+      continue;
+    b.clone(op, vmap);
+  }
+
+  // Annotate each local variable with pragmas (e.g. resource or array partition if needed)
+  // newCallee.walk([&](Operation *op) {
+  //   // for (auto result : op->getResults()) {
+  //   //   // TODO how to give attributes to OpResult type?
+  //   //   result->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
+  //   // }
+  //   op->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
+  // });
+
+  // Add function pragmas
+  newCallee->setAttr("phism.hls_pragma.inline_off", b.getUnitAttr());
+
+  // Mark new callee as PE
+  newCallee->setAttr("phism.pe", b.getUnitAttr());
+
+  // Link original PE function with the new one in a map, so that callers can get their arguments updated
+  PE_FuncOp_old_to_new_map[PE_func_op.getName()] = newCallee;
+
+  // Erase original PE function
+  PE_func_op->erase();
+
+  // Add systolic array specific I/O
+  // Split affine for loops into smaller loops
+
+
+
 }
+
+// template <typename OpType>
+// static bool contains(Block &block) {
+//   for (auto &op : block) {
+//     if (dyn_cast<OpType>(op)) {
+//       return true;
+//     }
+//   }
+//   return false;
+// }
 
 
 namespace {
@@ -123,22 +252,28 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
-    SmallVector<mlir::AffineForOp> to_create_PE;
-    m.walk([&](mlir::AffineForOp op) {
-      LLVM_DEBUG(dbgs() << "op name: " << op << "\n");
-      // TODO find a proper way of determining time loops from polyhedral analysis
-      bool contains_affine_for = contains<AffineForOp>(*op.getBody());
-      LLVM_DEBUG(dbgs() << "Op contains more AffineForOp inside?: " << contains_affine_for << "\n");
-      if (!contains_affine_for) {
-        to_create_PE.push_back(op);
-      }
+    // Modify each PE callee
+    SmallVector<mlir::FuncOp> PE_func_ops;
+    m.walk([&](mlir::FuncOp op) {
+      if (op->hasAttr("phism.pe"))
+        PE_func_ops.push_back(op);
     });
 
-    for (mlir::AffineForOp op : to_create_PE) {
-      createPE(op);
+    for (mlir::FuncOp op : PE_func_ops) {
+      handleCalleePE(op);
+    }
+    
+    // Update each PE caller arguments to match the new callee arguments
+    SmallVector<mlir::CallOp> PE_call_ops;
+    m.walk([&](mlir::CallOp op) {
+      if (op->hasAttr("phism.pe"))
+        PE_call_ops.push_back(op);
+    });
+
+    for (mlir::CallOp op : PE_call_ops) {
+      handleCallerPE(op);
     }
 
-    
   }
 };
 } // namespace
