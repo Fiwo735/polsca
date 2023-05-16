@@ -5,6 +5,19 @@ vhls=/scratch/shared/Xilinx/
 th=1
 example=2mm
 
+# Steps to start on Beholder server:
+# $ vagrant up && vagrant ssh
+# $ cd /vagrant
+# $ make shell
+
+# To run:
+# $ source scripts/source-all.sh && make ... # (e.g. test-emit)
+
+# To build:
+# $ source ~/.bashrc && ./scripts/build-phism.sh
+
+# Searching LLVM:
+# grep ./polygeist/llvm-project/mlir/lib/ ./polygeist/llvm-project/mlir/include/mlir/ -nRe "pattern"
 
 .PHONY: build-docker shell install-pyphism test-example test-emit test-polybench test-polybench-polymer build-phism sync clean clean-phism
 
@@ -20,7 +33,7 @@ test-example:
 	python3 scripts/pb-flow.py ./example/polybench -e $(example) --work-dir ./tmp/phism/pb-flow.tmp --cosim
 
 test-emit:
-	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls
+	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls --loop-transforms --array-partition
 
 # Evaluate polybench (baseline) - need to be used in environment
 test-polybench:
