@@ -154,4 +154,15 @@ def SystolicArrayTimeLoopPass : Pass<"systolic-array-time-loop", "::mlir::Module
   ];
 }
 
+def SystolicArraySpaceLoopPass : Pass<"systolic-array-space-loop", "::mlir::ModuleOp"> {
+  let summary = "TODO";
+  let description = [{ 
+    TODO
+  }];
+  let constructor = "phism::createSystolicArraySpaceLoopPass()";
+  let options = [
+    Option<"fileName", "file-name", "std::string", /*default=*/"", "The output code">
+  ];
+}
+
 #endif

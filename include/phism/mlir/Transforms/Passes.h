@@ -26,6 +26,7 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createSCoPDecompositionPass
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createInlineSCoPAffinePass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createEmitHLSPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createSystolicArrayTimeLoopPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createSystolicArraySpaceLoopPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

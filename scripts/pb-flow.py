@@ -85,6 +85,11 @@ def main():
         "--diamond-tiling", action="store_true", help="Use diamond tiling"
     )
     parser.add_argument(
+        "--systolic-array",
+        action="store_true",
+        help="Systolic array synthesis",
+    )
+    parser.add_argument(
         "--emit-hls",
         action="store_true",
         help="Raise MLIR to HLS C/C++",

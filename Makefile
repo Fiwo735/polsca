@@ -11,7 +11,7 @@ example=2mm
 # $ make shell
 
 # To run:
-# $ source scripts/source-all.sh && make ... # (e.g. test-emit)
+# $ source scripts/source-all.sh && make test-systolic # (or any other test-*)
 
 # To build:
 # $ source ~/.bashrc && ./scripts/build-phism.sh
@@ -32,8 +32,11 @@ shell: build-docker
 test-example:
 	python3 scripts/pb-flow.py ./example/polybench -e $(example) --work-dir ./tmp/phism/pb-flow.tmp --cosim
 
-test-emit:
-	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls --loop-transforms --array-partition
+test-systolic:
+	python3 scripts/pb-flow.py ./example/polybench -e 2mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls --loop-transforms --array-partition --systolic-array
+
+test-systolic-SA:
+	python3 scripts/pb-flow.py ./example/auto_sa -e mm --work-dir ./tmp/phism/pb-flow.tmp --skip-vitis --emit-hls --loop-transforms --array-partition --systolic-array	
 
 # Evaluate polybench (baseline) - need to be used in environment
 test-polybench:

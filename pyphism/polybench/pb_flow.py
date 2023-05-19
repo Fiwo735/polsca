@@ -26,6 +26,7 @@ from pyphism.polybench.utils import vhdl
 
 POLYBENCH_DATASETS = ("MINI", "SMALL", "MEDIUM", "LARGE", "EXTRALARGE")
 POLYBENCH_EXAMPLES = (
+    # "mm", # TODO AutoSA test
     "2mm",
     "3mm",
     "adi",
@@ -102,6 +103,7 @@ class PbFlowOptions(PhismRunnerOptions):
     skip_csim: bool = False  # Given cosim = True, you can still turn down csim.
     sanity_check: bool = False  # Run pb-flow in sanity check mode
     emit_hls: bool = False # Raise to C/C++ HLS instead of using LLVM IR for running Vitis HLS
+    systolic_array: bool = False
 
     array_partition_v2: bool = False  # Use the newer array partition (TODO: migrate)
 
@@ -928,14 +930,15 @@ class PbFlow(PhismRunner):
             return self
 
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
-            ".mlir", ".cpp"
+            ".mlir", ".emit.mlir"
         )
-        log_file = self.cur_file.replace(".cpp", ".cpp.log")
-
+        log_file = self.cur_file.replace(".mlir", ".log")
+        cpp_file = self.cur_file.replace(".mlir", ".cpp")
+        
         args = [
             self.get_program_abspath("phism-opt"),
             src_file,
-            f'-emit-hls',
+            f'-emit-hls="file-name={cpp_file}"',
             "-debug-only=emit-hls",
         ]
 
@@ -980,25 +983,15 @@ class PbFlow(PhismRunner):
         return self
 
     def check_if_systolic_array_possible(self):
-        return True
+        # Check if phism.pe attribute exists
+        # TODO find a better method
+        with open(self.cur_file, "r") as f:
+            if "attributes {phism.pe}" in f.read():
+                return True
+        return False
 
     def post_poly(self):
-        return (
-            # Systolic array possible so use corresponding transforms
-            self.sanity_check()
-            .constant_args()
-            .sanity_check()
-            .loop_transforms()
-            .sanity_check()
-            .array_partition()
-            .sanity_check(no_diff=True)
-            .scop_stmt_inline()
-            .sanity_check(no_diff=True)
-            .systolic_array_time_loop_transform()
-            .sanity_check() #TODO diff or no diff?
-
-        ) if self.check_if_systolic_array_possible() else (
-            # Systolic array not possible so use default transforms
+        res = (
             self.sanity_check()
             .constant_args()
             .sanity_check()
@@ -1009,6 +1002,20 @@ class PbFlow(PhismRunner):
             .scop_stmt_inline()
             .sanity_check(no_diff=True)
         )
+        if self.options.systolic_array:
+            if self.check_if_systolic_array_possible():
+                # Systolic array possible and wanted so use corresponding transforms
+                res = (
+                    res.systolic_array_time_loop_transform()
+                    .systolic_array_space_loop_transform()
+                    .sanity_check() #TODO diff or no diff?
+                )
+            else:
+                self.logger.debug(
+                    "Skipped systolic array transforms since it is not possible."
+                )
+
+        return res
 
     def systolic_array_time_loop_transform(self):
         src_file, self.cur_file = self.cur_file, self.cur_file.replace(
@@ -1039,20 +1046,20 @@ class PbFlow(PhismRunner):
         )
         log_file = self.cur_file.replace(".mlir", ".log")
 
-        # args = [
-        #     self.get_program_abspath("phism-opt"),
-        #     src_file,
-        #     f'-systolic-array',
-        #     "-debug-only=systolic-array",
-        # ]
+        args = [
+            self.get_program_abspath("phism-opt"),
+            src_file,
+            f'-systolic-array-space-loop',
+            "-debug-only=systolic-array-space-loop",
+        ]
 
-        # self.run_command(
-        #     cmd=" ".join(args),
-        #     shell=True,
-        #     stderr=open(log_file, "w"),
-        #     stdout=open(self.cur_file, "w"),
-        #     env=self.env,
-        # )
+        self.run_command(
+            cmd=" ".join(args),
+            shell=True,
+            stderr=open(log_file, "w"),
+            stdout=open(self.cur_file, "w"),
+            env=self.env,
+        )
 
         return self
         

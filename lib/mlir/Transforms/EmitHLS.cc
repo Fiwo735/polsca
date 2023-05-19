@@ -189,7 +189,7 @@ static std::vector<QArgType *> parseHlsParam(std::string param) {
     // Parse a single arg
     if (countSubstring(",,", token) != 4)
       llvm_unreachable(
-          "Invalid HLS paramter format (expected 4 commas), please double "
+          "Invalid HLS parameter format (expected 4 commas), please double "
           "check: {name},,{direction},,{ty},,{size},,{precision};");
 
     auto newTy = new QArgType;
@@ -357,6 +357,7 @@ static std::string getTypeName(Value value) {
 
   // if (isa<IndexType>(valueType)) // seems to be newer LLVM version
   if (valueType.isa<IndexType>())
+    // TODO change unsigned to ap_uint<?> where ? is big enough to fit for loop's upper bound
     return "unsigned";
   // if (auto intType = dyn_cast<IntegerType>(valueType)) { // seems to be newer LLVM version
   if (auto intType = valueType.dyn_cast<IntegerType>()) {
@@ -700,10 +701,6 @@ static std::string emitOp(AffineForOp affineForOp) {
     for (auto &expr : llvm::drop_begin(upperMap.getResults(), 1))
       upperBound += ", " + upperBoundPrinter.getAffineExpr(expr) + ")";
   }
-
-  // TODO This should happen implictly if iter was IndexType instead of BlockArgument
-  // unitTypeMap[iter] = "int";
-  LLVM_DEBUG(dbgs() << "getTypeName(iter): " << getTypeName(iter) << "\n");
 
   return indent() + "for (" + getTypeName(iter) + " " + iterName + " = " +
          lowerBound + "; " + iterName + " < " + upperBound + "; " + iterName +
@@ -1171,6 +1168,39 @@ static std::string declareValue(Value value) {
   return indent() + getTypeName(value) + " " + getValueName(value) + ";\n";
 }
 
+static std::string getStringFromAttribute(Attribute attribute) {
+  return attribute.dyn_cast<StringAttr>().getValue().str();
+}
+
+static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
+  std::vector<std::string> type_names = {};
+  
+  // No manually set argument types so find them with getTypeName(...)
+  if (!funcOp->hasAttr("phism.argument_types")) {
+    for (auto arg : funcOp.getArguments()) {
+      type_names.push_back(getTypeName(arg));
+    }
+
+  // Manually set argument types so parse phism.argument_types attribute
+  } else {
+    // StringAttr type_names_str_attr = funcOp->getAttr("phism.argument_types").dyn_cast<StringAttr>();
+    // std::string type_names_str = type_names_str_attr.getValue().str();
+    std::string type_names_str = getStringFromAttribute(funcOp->getAttr("phism.argument_types"));
+
+    size_t pos = 0;
+    std::string token;
+
+    while ((pos = type_names_str.find(".")) != std::string::npos) {
+      token = type_names_str.substr(0, pos);
+      type_names_str.erase(0, pos + 1);
+      type_names.push_back(token);
+    }
+    type_names.push_back(type_names_str);
+  }
+
+  return type_names;
+}
+
 static std::string emitOp(mlir::FuncOp funcOp) {
   // Pre-condition check
   checkFuncOp(funcOp);
@@ -1180,16 +1210,18 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   std::string funcOpBuff = indent() + "void " + funcOp.getName().str() + "(";
 
   // Emit input arguments.
+  std::vector<std::string> type_names = getArgumentTypeNames(funcOp);
+  std::string type_name;
   std::string argName;
   // SmallVector<Value, 8> args;
-  for (auto &arg : funcOp.getArguments()) {
+  for (auto arg : llvm::enumerate(funcOp.getArguments())) {
     // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
     // if (!arg.getType().dyn_cast<ShapedType>())
     //   llvm_unreachable("Function arg has scalar type. This is not supported.");
     // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
-    argName = (arg.getType().dyn_cast<ShapedType>()) ? getArrayInit(arg)
-                                                         : getValueName(arg);
-    funcOpBuff += getTypeName(arg) + " " + argName + ", ";
+    type_name = type_names[arg.index()];
+    argName = (arg.value().getType().dyn_cast<ShapedType>()) ? getArrayInit(arg.value()) : getValueName(arg.value());
+    funcOpBuff += type_name + " " + argName + ", ";
   }
   // Get rid of the last comma and space
   funcOpBuff.pop_back();
@@ -1199,7 +1231,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   indent.add();
 
   // Emit HLS pragmas
-  if (funcOp->hasAttr("phism.hls_pragma.inline_off")) {
+  if (funcOp->hasAttr("phism.hls_pragma.inline")) {
     funcOpBuff += pragmaGen("INLINE OFF");
   }
 
@@ -1215,9 +1247,11 @@ static std::string emitOp(mlir::FuncOp funcOp) {
         op->emitError(" has been declared.");
 
       funcOpBuff += declareValue(result);
-      funcOpBuff += pragmaGen("RESOURCE TODO");
+      if (funcOp->hasAttr("phism.pe"))
+        funcOpBuff += pragmaGen("RESOURCE TODO");
     }
   });
+  funcOpBuff += "\n";
   indent.sub();
 
   // Emit funcOption body.

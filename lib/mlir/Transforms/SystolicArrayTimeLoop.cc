@@ -1,4 +1,4 @@
-//===- SystolicArrayTimeLoop.cc ----------------------------------------------------===//
+//===- SystolicArrayTimeLoop.cc -------------------------------------------===//
 //
 // This file implements passes that TODO
 //
@@ -103,39 +103,24 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
 
   FuncOp newCallee = PE_FuncOp_old_to_new_map[PE_call_op.getCallee()];
 
-  OpBuilder b(PE_call_op.getContext());
+  MLIRContext *context = PE_call_op.getContext();
 
-  // New caller argument types.
-  // SmallVector<Type> newArgTypes;
-  // for (auto arg : PE_call_op.getArgOperands()) {
-  //   LLVM_DEBUG(dbgs() << "arg: " << arg << ", arg.getType():" << arg.getType() << "\n");
-  //   newArgTypes.push_back(arg.getType());
-  // }
-  // newArgTypes.push_back(zeroConstant.getType());
+  OpBuilder b(context);
+  b.setInsertionPointAfter(PE_call_op);
 
   SmallVector<Value> operands;
   for (auto arg : PE_call_op.getOperands())
     operands.push_back(arg);
 
   Value some_constant = b.create<arith::ConstantIndexOp>(PE_call_op.getLoc(), 123);
-  // operands.push_back(some_constant);
-  // The above throws an error because of <<UNKNOWN SSA VALUE>>, so using below as a temporary solution:
-  operands.push_back(PE_call_op.getOperands()[1]);
+  operands.push_back(some_constant);
 
-  b.setInsertionPointAfter(PE_call_op);
   CallOp newCaller = b.create<CallOp>(
     PE_call_op.getLoc(),
     newCallee,
     operands
   );
 
-    // newFuncType,
-    // PE_call_op.getCalleeAttr(),
-    // PE_call_op.getResultTypes(),
-    // std::string(PE_call_op.getCallee()) + "_new",
-
-  // New caller function type.
-  // FunctionType newFuncType = b.getFunctionType(newArgTypes, PE_call_op->getResultTypes());
   LLVM_DEBUG({
     dbgs() << " * New caller created:\n";
     newCaller.dump();
@@ -147,13 +132,30 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
 
 }
 
+// TODO this could be done better with stringstream
+static std::string convertArgumentTypes(const std::vector<std::string>& argument_types) {
+  char delimiter = '.';
+
+  std::string result = "";
+  for (const auto &argument_type: argument_types) {
+    result += argument_type + delimiter;
+  }
+
+  // Remove trailing delimiter
+  result.pop_back();
+
+  return result;
+}
+
 static void handleCalleePE(mlir::FuncOp PE_func_op) {
   LLVM_DEBUG({
     dbgs() << " * FuncOp to handle:\n";
     PE_func_op.dump();
   });
 
-  OpBuilder b(PE_func_op.getContext());
+  MLIRContext *context = PE_func_op.getContext();
+
+  OpBuilder b(context);
 
 
   // Add indexes to arguments and instantiate as local variables (e.g. for easier debug and monitoring)
@@ -208,23 +210,44 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   //   op->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
   // });
 
-  // Add function pragmas
-  newCallee->setAttr("phism.hls_pragma.inline_off", b.getUnitAttr());
 
-  // Mark new callee as PE
+
+
+  // Split affine for loops into smaller loops
+
+
+
+  // Add systolic array specific I/O
+
+
+  // Copy all original attributes
   newCallee->setAttr("phism.pe", b.getUnitAttr());
+  // TODO why reusing all old args doesnt work? (i.e. causes issue with operand types/number)
+  // newCallee->setAttrs(PE_func_op->getAttrs());
+
+  // Add function pragmas
+  newCallee->setAttr("phism.hls_pragma.inline", StringAttr::get(context, "OFF"));
+
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {
+    "ap_fixed<8, 5>",
+    "unsigned",
+    "unsigned",
+    "ap_fixed<8, 5>",
+    "ap_fixed<8, 5>",
+    "unsigned"
+  };
+  newCallee->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, convertArgumentTypes(argument_types))
+  );
 
   // Link original PE function with the new one in a map, so that callers can get their arguments updated
   PE_FuncOp_old_to_new_map[PE_func_op.getName()] = newCallee;
 
   // Erase original PE function
   PE_func_op->erase();
-
-  // Add systolic array specific I/O
-  // Split affine for loops into smaller loops
-
-
-
 }
 
 // template <typename OpType>

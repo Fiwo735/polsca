@@ -15,6 +15,7 @@ add_mlir_library(PhismTransforms
   LoadSwitch.cc
   EmitHLS.cc
   SystolicArrayTimeLoop.cc
+  SystolicArraySpaceLoop.cc
   Utils.cc
 
   ADDITIONAL_HEADER_DIRS
