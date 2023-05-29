@@ -155,6 +155,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   MLIRContext *context = PE_func_op.getContext();
   OpBuilder b(context);
 
+  Operation *oldRet = PE_func_op.getTerminator();
+
   // Add indexes to arguments and instantiate as local variables (e.g. for
   // easier debug and monitoring)
   SmallVector<Type> newArgTypes;
@@ -164,10 +166,12 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   // TODO this is last argument and not first to avoid conflicts when changing
   // order of argument usage, i.e. operations in blocks still refer to the old
   // argument order
-  Value zeroConstant = b.create<arith::ConstantIndexOp>(PE_func_op.getLoc(), 0);
+  // Value zeroConstant = b.create<arith::ConstantIndexOp>(PE_func_op.getLoc(),
+  // 0);
   // TODO use setAttr to set name for EmitHLS (like idx etc) -> how to do it for
   // a Value type zeroConstant.setAttr("phism.name.idx", b.getUnitAttr());
-  newArgTypes.push_back(zeroConstant.getType());
+  // newArgTypes.push_back(zeroConstant.getType());
+  newArgTypes.push_back(IndexType::get(context));
 
   // New callee function type.
   FunctionType newFuncType =
@@ -176,24 +180,45 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   FuncOp newCallee = b.create<FuncOp>(
       PE_func_op.getLoc(), std::string(PE_func_op.getName()), newFuncType);
 
-  Block *entry = newCallee.addEntryBlock();
-  b.setInsertionPointToStart(entry);
+  // Block *entry = newCallee.addEntryBlock();
+  // b.setInsertionPointToStart(entry);
+
+  auto block = b.createBlock(&newCallee.getBody());
+  for (auto argType : newArgTypes)
+    block->addArgument(argType, newCallee.getLoc());
+
+  b.setInsertionPointToStart(block);
+  AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
+  b.create<mlir::ReturnOp>(PE_func_op.getLoc());
+
+  // b.createBlock(loop0.getBody());
+  b.setInsertionPointToStart(loop0.getBody());
+  b.inlineRegionBefore(PE_func_op.getBody(), loop0.getBody(), loop0.end());
+
+  // remove return in the affine for body
 
   // Add additional loops - does NOT work
-  AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
   // b.insert(loop0); ????
 
-  b.setInsertionPointToEnd(entry);
+  // b.setInsertionPointToEnd(entry);
 
-  b.create<mlir::ReturnOp>(PE_func_op.getLoc());
   LLVM_DEBUG({
     dbgs() << " * New callee created (body empty):\n";
     newCallee.dump();
   });
 
-  b.setInsertionPointToStart(entry);
-
   // Argument map.
+
+  // llvm::DenseMap<Value, Value> map;
+  // auto i = 0;
+  // for (auto arg : PE_func_op.getArguments()) {
+  //   map[arg] = newCallee.getArgument(i++);
+  // }
+  for (auto arg : PE_func_op.getArguments()) {
+    arg.replaceAllUsesWith(newCallee.getArgument(i++));
+  }
+  // value.replaceAllUsesWith(map[value]);
+
   BlockAndValueMapping vmap;
   S vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
 
@@ -215,6 +240,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   // });
 
   // Add systolic array specific I/O
+
+  oldRet->erase();
 
   // Copy all original attributes
   newCallee->setAttr("phism.pe", b.getUnitAttr());
@@ -238,6 +265,7 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   PE_FuncOp_old_to_new_map[PE_func_op.getName()] = newCallee;
 
   // Erase original PE function
+  // assert(PE_func_op->use_empty());
   PE_func_op->erase();
 }
 
