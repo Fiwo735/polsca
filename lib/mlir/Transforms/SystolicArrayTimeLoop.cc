@@ -154,12 +154,10 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   });
 
   MLIRContext *context = PE_func_op.getContext();
-
   OpBuilder b(context);
 
 
   // Add indexes to arguments and instantiate as local variables (e.g. for easier debug and monitoring)
-  // New callee argument types.
   SmallVector<Type> newArgTypes;
   for (auto arg : PE_func_op.getArguments()) {
     newArgTypes.push_back(arg.getType());
@@ -182,15 +180,29 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   );
 
   Block *entry = newCallee.addEntryBlock();
+  b.setInsertionPointToStart(entry);
+
+  // Add additional loops - does NOT work
+  AffineForOp loop0 = b.create<AffineForOp>(
+    PE_func_op.getLoc(),
+    0,
+    100,
+    5
+  );
+  // b.insert(loop0); ????
+
   b.setInsertionPointToEnd(entry);
+
   b.create<mlir::ReturnOp>(PE_func_op.getLoc());
   LLVM_DEBUG({
     dbgs() << " * New callee created (body empty):\n";
     newCallee.dump();
   });
 
+  b.setInsertionPointToStart(entry);
+
   // Argument map.
-  BlockAndValueMapping vmap;
+  BlockAndValueMapping vmap;S
   vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
 
   // Iterate every operation in the original callee and clone it to the new one.
@@ -213,11 +225,15 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
 
 
 
-  // Split affine for loops into smaller loops
-
-
-
   // Add systolic array specific I/O
+
+
+
+
+
+
+
+
 
 
   // Copy all original attributes
@@ -249,17 +265,6 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   // Erase original PE function
   PE_func_op->erase();
 }
-
-// template <typename OpType>
-// static bool contains(Block &block) {
-//   for (auto &op : block) {
-//     if (dyn_cast<OpType>(op)) {
-//       return true;
-//     }
-//   }
-//   return false;
-// }
-
 
 namespace {
 class SystolicArrayTimeLoopPass : public phism::SystolicArrayTimeLoopPassBase<SystolicArrayTimeLoopPass> {
