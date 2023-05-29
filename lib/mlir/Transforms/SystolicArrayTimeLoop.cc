@@ -9,26 +9,31 @@
 #include "phism/mlir/Transforms/PhismTransforms.h"
 
 #include "mlir/Analysis/CallGraph.h"
-// #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h" // 1) not found -> works when replaced by removing /Dialect/Affine/
+// #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h" // 1) not found ->
+// works when replaced by removing /Dialect/Affine/
 #include "mlir/Analysis/AffineAnalysis.h"
-// #include "mlir/Dialect/Affine/Analysis/Utils.h" // 2) not found -> works when  replaced by removing /Dialect/Affine/
+// #include "mlir/Dialect/Affine/Analysis/Utils.h" // 2) not found -> works when
+// replaced by removing /Dialect/Affine/
 #include "mlir/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
-// #include "mlir/Dialect/Func/IR/FuncOps.h" // 3) not found -> doesn't exist in LLVM 14, use mlir:: namespace instead of func::
-// #include "mlir/Dialect/Linalg/IR/Linalg.h" // 4) not found -> seems to be not needed
+// #include "mlir/Dialect/Func/IR/FuncOps.h" // 3) not found -> doesn't exist in
+// LLVM 14, use mlir:: namespace instead of func:: #include
+// "mlir/Dialect/Linalg/IR/Linalg.h" // 4) not found -> seems to be not needed
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BlockAndValueMapping.h"
-// #include "mlir/Dialect/SCF/IR/SCF.h" // 5) not found -> works when replaced by removing /IR/
+// #include "mlir/Dialect/SCF/IR/SCF.h" // 5) not found -> works when replaced
+// by removing /IR/
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
-// #include "mlir/Tools/mlir-translate/Translation.h" // 6) not found -> works when replaced by removing /Tools/mlir-translate/
-#include "mlir/Translation.h"
+// #include "mlir/Tools/mlir-translate/Translation.h" // 6) not found -> works
+// when replaced by removing /Tools/mlir-translate/
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Translation.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -47,11 +52,10 @@ using namespace phism;
 //----------------------------------------------------------------------------//
 
 namespace {
-struct SystolicArrayTimeLoopPipelineOptions : public mlir::PassPipelineOptions<SystolicArrayTimeLoopPipelineOptions> {
-  Option<std::string> fileName{
-    *this, "file-name",
-    llvm::cl::desc("The output HLS code")
-  };
+struct SystolicArrayTimeLoopPipelineOptions
+    : public mlir::PassPipelineOptions<SystolicArrayTimeLoopPipelineOptions> {
+  Option<std::string> fileName{*this, "file-name",
+                               llvm::cl::desc("The output HLS code")};
 };
 } // namespace
 
@@ -94,7 +98,6 @@ static int countSubstring(std::string pat, std::string txt) {
 // TODO llvm::DenseMap?
 std::map<llvm::StringRef, mlir::FuncOp> PE_FuncOp_old_to_new_map;
 
-
 static void handleCallerPE(mlir::CallOp PE_call_op) {
   LLVM_DEBUG({
     dbgs() << " * CallOp to handle:\n";
@@ -112,14 +115,11 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
   for (auto arg : PE_call_op.getOperands())
     operands.push_back(arg);
 
-  Value some_constant = b.create<arith::ConstantIndexOp>(PE_call_op.getLoc(), 123);
+  Value some_constant =
+      b.create<arith::ConstantIndexOp>(PE_call_op.getLoc(), 123);
   operands.push_back(some_constant);
 
-  CallOp newCaller = b.create<CallOp>(
-    PE_call_op.getLoc(),
-    newCallee,
-    operands
-  );
+  CallOp newCaller = b.create<CallOp>(PE_call_op.getLoc(), newCallee, operands);
 
   LLVM_DEBUG({
     dbgs() << " * New caller created:\n";
@@ -128,16 +128,15 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
 
   // Erase original CallOp
   PE_call_op->erase();
-
-
 }
 
 // TODO this could be done better with stringstream
-static std::string convertArgumentTypes(const std::vector<std::string>& argument_types) {
+static std::string
+convertArgumentTypes(const std::vector<std::string> &argument_types) {
   char delimiter = '.';
 
   std::string result = "";
-  for (const auto &argument_type: argument_types) {
+  for (const auto &argument_type : argument_types) {
     result += argument_type + delimiter;
   }
 
@@ -156,39 +155,32 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   MLIRContext *context = PE_func_op.getContext();
   OpBuilder b(context);
 
-
-  // Add indexes to arguments and instantiate as local variables (e.g. for easier debug and monitoring)
+  // Add indexes to arguments and instantiate as local variables (e.g. for
+  // easier debug and monitoring)
   SmallVector<Type> newArgTypes;
   for (auto arg : PE_func_op.getArguments()) {
     newArgTypes.push_back(arg.getType());
   }
-  // TODO this is last argument and not first to avoid conflicts when changing order of argument usage,
-  // i.e. operations in blocks still refer to the old argument order
+  // TODO this is last argument and not first to avoid conflicts when changing
+  // order of argument usage, i.e. operations in blocks still refer to the old
+  // argument order
   Value zeroConstant = b.create<arith::ConstantIndexOp>(PE_func_op.getLoc(), 0);
-  // TODO use setAttr to set name for EmitHLS (like idx etc) -> how to do it for a Value type
-  // zeroConstant.setAttr("phism.name.idx", b.getUnitAttr());
+  // TODO use setAttr to set name for EmitHLS (like idx etc) -> how to do it for
+  // a Value type zeroConstant.setAttr("phism.name.idx", b.getUnitAttr());
   newArgTypes.push_back(zeroConstant.getType());
-  
 
   // New callee function type.
-  FunctionType newFuncType = b.getFunctionType(newArgTypes, PE_func_op->getResultTypes());
+  FunctionType newFuncType =
+      b.getFunctionType(newArgTypes, PE_func_op->getResultTypes());
   b.setInsertionPointAfter(PE_func_op);
   FuncOp newCallee = b.create<FuncOp>(
-    PE_func_op.getLoc(),
-    std::string(PE_func_op.getName()),
-    newFuncType
-  );
+      PE_func_op.getLoc(), std::string(PE_func_op.getName()), newFuncType);
 
   Block *entry = newCallee.addEntryBlock();
   b.setInsertionPointToStart(entry);
 
   // Add additional loops - does NOT work
-  AffineForOp loop0 = b.create<AffineForOp>(
-    PE_func_op.getLoc(),
-    0,
-    100,
-    5
-  );
+  AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
   // b.insert(loop0); ????
 
   b.setInsertionPointToEnd(entry);
@@ -202,8 +194,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   b.setInsertionPointToStart(entry);
 
   // Argument map.
-  BlockAndValueMapping vmap;S
-  vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
+  BlockAndValueMapping vmap;
+  S vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
 
   // Iterate every operation in the original callee and clone it to the new one.
   b.setInsertionPointToStart(entry);
@@ -213,8 +205,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
     b.clone(op, vmap);
   }
 
-  // Annotate each local variable with pragmas (e.g. resource or array partition if needed)
-  // newCallee.walk([&](Operation *op) {
+  // Annotate each local variable with pragmas (e.g. resource or array partition
+  // if needed) newCallee.walk([&](Operation *op) {
   //   // for (auto result : op->getResults()) {
   //   //   // TODO how to give attributes to OpResult type?
   //   //   result->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
@@ -222,44 +214,27 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   //   op->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
   // });
 
-
-
-
   // Add systolic array specific I/O
-
-
-
-
-
-
-
-
-
 
   // Copy all original attributes
   newCallee->setAttr("phism.pe", b.getUnitAttr());
-  // TODO why reusing all old args doesnt work? (i.e. causes issue with operand types/number)
-  // newCallee->setAttrs(PE_func_op->getAttrs());
+  // TODO why reusing all old args doesnt work? (i.e. causes issue with operand
+  // types/number) newCallee->setAttrs(PE_func_op->getAttrs());
 
   // Add function pragmas
-  newCallee->setAttr("phism.hls_pragma.inline", StringAttr::get(context, "OFF"));
-
+  newCallee->setAttr("phism.hls_pragma.inline",
+                     StringAttr::get(context, "OFF"));
 
   // Expicitly mark argument types
-  std::vector<std::string> argument_types = {
-    "ap_fixed<8, 5>",
-    "unsigned",
-    "unsigned",
-    "ap_fixed<8, 5>",
-    "ap_fixed<8, 5>",
-    "unsigned"
-  };
+  std::vector<std::string> argument_types = {"ap_fixed<8, 5>", "unsigned",
+                                             "unsigned",       "ap_fixed<8, 5>",
+                                             "ap_fixed<8, 5>", "unsigned"};
   newCallee->setAttr(
-    "phism.argument_types",
-    StringAttr::get(context, convertArgumentTypes(argument_types))
-  );
+      "phism.argument_types",
+      StringAttr::get(context, convertArgumentTypes(argument_types)));
 
-  // Link original PE function with the new one in a map, so that callers can get their arguments updated
+  // Link original PE function with the new one in a map, so that callers can
+  // get their arguments updated
   PE_FuncOp_old_to_new_map[PE_func_op.getName()] = newCallee;
 
   // Erase original PE function
@@ -267,15 +242,15 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
 }
 
 namespace {
-class SystolicArrayTimeLoopPass : public phism::SystolicArrayTimeLoopPassBase<SystolicArrayTimeLoopPass> {
+class SystolicArrayTimeLoopPass
+    : public phism::SystolicArrayTimeLoopPassBase<SystolicArrayTimeLoopPass> {
 public:
-
   std::string fileName = "";
 
   SystolicArrayTimeLoopPass() = default;
-  SystolicArrayTimeLoopPass(const SystolicArrayTimeLoopPipelineOptions & options)
-    : fileName(!options.fileName.hasValue() ? "" : options.fileName.getValue()){
-  }
+  SystolicArrayTimeLoopPass(const SystolicArrayTimeLoopPipelineOptions &options)
+      : fileName(!options.fileName.hasValue() ? ""
+                                              : options.fileName.getValue()) {}
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
@@ -290,7 +265,7 @@ public:
     for (mlir::FuncOp op : PE_func_ops) {
       handleCalleePE(op);
     }
-    
+
     // Update each PE caller arguments to match the new callee arguments
     SmallVector<mlir::CallOp> PE_call_ops;
     m.walk([&](mlir::CallOp op) {
@@ -301,7 +276,6 @@ public:
     for (mlir::CallOp op : PE_call_ops) {
       handleCallerPE(op);
     }
-
   }
 };
 } // namespace
@@ -313,9 +287,9 @@ phism::createSystolicArrayTimeLoopPass() {
 
 void phism::registerSystolicArrayTimeLoopPass() {
   PassPipelineRegistration<SystolicArrayTimeLoopPipelineOptions>(
-    "systolic-array-time-loop", "Systolic array time loop TODO.",
-    [](OpPassManager &pm, const SystolicArrayTimeLoopPipelineOptions &options) {
-      pm.addPass(std::make_unique<SystolicArrayTimeLoopPass>(options));
-    }
-  );
+      "systolic-array-time-loop", "Systolic array time loop TODO.",
+      [](OpPassManager &pm,
+         const SystolicArrayTimeLoopPipelineOptions &options) {
+        pm.addPass(std::make_unique<SystolicArrayTimeLoopPass>(options));
+      });
 }
