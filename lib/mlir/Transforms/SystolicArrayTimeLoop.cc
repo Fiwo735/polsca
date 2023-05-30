@@ -30,6 +30,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
+#include "mlir/Transforms/DialectConversion.h"
+
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -121,6 +123,8 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
     operands
   );
 
+  newCaller->setAttr("phism.pe", b.getUnitAttr());
+
   LLVM_DEBUG({
     dbgs() << " * New caller created:\n";
     newCaller.dump();
@@ -148,14 +152,14 @@ static std::string convertArgumentTypes(const std::vector<std::string>& argument
 }
 
 static void handleCalleePE(mlir::FuncOp PE_func_op) {
-  LLVM_DEBUG({
-    dbgs() << " * FuncOp to handle:\n";
-    PE_func_op.dump();
-  });
+  LLVM_DEBUG({dbgs() << " * FuncOp to handle:\n"; PE_func_op.dump();});
 
   MLIRContext *context = PE_func_op.getContext();
-  OpBuilder b(context);
+  // OpBuilder b(context);
+  ConversionPatternRewriter b(context);
 
+  // Save pointer to original yield op
+  Operation *oldRet = PE_func_op.getBody().back().getTerminator();
 
   // Add indexes to arguments and instantiate as local variables (e.g. for easier debug and monitoring)
   SmallVector<Type> newArgTypes;
@@ -164,12 +168,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   }
   // TODO this is last argument and not first to avoid conflicts when changing order of argument usage,
   // i.e. operations in blocks still refer to the old argument order
-  Value zeroConstant = b.create<arith::ConstantIndexOp>(PE_func_op.getLoc(), 0);
-  // TODO use setAttr to set name for EmitHLS (like idx etc) -> how to do it for a Value type
-  // zeroConstant.setAttr("phism.name.idx", b.getUnitAttr());
-  newArgTypes.push_back(zeroConstant.getType());
+  newArgTypes.push_back(IndexType::get(context));
   
-
   // New callee function type.
   FunctionType newFuncType = b.getFunctionType(newArgTypes, PE_func_op->getResultTypes());
   b.setInsertionPointAfter(PE_func_op);
@@ -179,39 +179,53 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
     newFuncType
   );
 
-  Block *entry = newCallee.addEntryBlock();
-  b.setInsertionPointToStart(entry);
+  // Create a block in the new Func Op and add original arguments to it
+  Block *block = b.createBlock(&newCallee.getBody());
+  for (auto argType : newArgTypes)
+    block->addArgument(argType, newCallee.getLoc());
 
-  // Add additional loops - does NOT work
-  AffineForOp loop0 = b.create<AffineForOp>(
-    PE_func_op.getLoc(),
-    0,
-    100,
-    5
-  );
-  // b.insert(loop0); ????
-
-  b.setInsertionPointToEnd(entry);
-
+  // Add additional loops
+  b.setInsertionPointToStart(block);
+  AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
   b.create<mlir::ReturnOp>(PE_func_op.getLoc());
-  LLVM_DEBUG({
-    dbgs() << " * New callee created (body empty):\n";
-    newCallee.dump();
-  });
 
-  b.setInsertionPointToStart(entry);
+  // Copy PE_func_op body into loop0 by inlining
+  b.setInsertionPointToStart(loop0.getBody());
+  b.inlineRegionBefore(PE_func_op.getBody(), loop0.region(), loop0.region().end());
+
+  // Erase old (redundant) yield op that came from the original PE_func_op
+  oldRet->erase();
+
+  // Replace original value uses with new values
+  auto i = 0;
+  for (auto arg : PE_func_op.getArguments()) {
+    arg.replaceAllUsesWith(newCallee.getArgument(i++));
+  }
+
+  LLVM_DEBUG({dbgs() << " * New callee created:\n"; newCallee.dump();});
+
+  // unsigned i = 0;
+  // for (auto arg : PE_func_op.getArguments()) {
+  //   arg.replaceAllUsesWith(newCallee.getArgument(i++));
+  // }
+
+  // b.setInsertionPointToStart(entry);
 
   // Argument map.
-  BlockAndValueMapping vmap;S
-  vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
+  // Block *loop_entry = b.createBlock(loop0.getBody());
+  // BlockAndValueMapping vmap;
+  // vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
+  // // vmap.map(PE_func_op.getArguments(), loop_entry->getArguments());
+  // LLVM_DEBUG({dbgs() << "BlockAndValueMapping created\n";});
 
-  // Iterate every operation in the original callee and clone it to the new one.
-  b.setInsertionPointToStart(entry);
-  for (Operation &op : PE_func_op.getBlocks().begin()->getOperations()) {
-    if (isa<mlir::ReturnOp>(op))
-      continue;
-    b.clone(op, vmap);
-  }
+  // // Iterate every operation in the original callee and clone it to the new one.
+  // b.setInsertionPointToStart(entry);
+  // for (Operation &op : PE_func_op.getBlocks().begin()->getOperations()) {
+  //   LLVM_DEBUG({dbgs() << "About to clone\n";});
+  //   if (isa<mlir::ReturnOp>(op))
+  //     continue;
+  //   b.clone(op, vmap);
+  // }
 
   // Annotate each local variable with pragmas (e.g. resource or array partition if needed)
   // newCallee.walk([&](Operation *op) {
@@ -221,6 +235,8 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   //   // }
   //   op->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
   // });
+
+
 
 
 
@@ -263,6 +279,11 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   PE_FuncOp_old_to_new_map[PE_func_op.getName()] = newCallee;
 
   // Erase original PE function
+  // LLVM_DEBUG({
+  //   dbgs() << "New callee created:\n";
+  //   newCallee.dump();
+  // });
+  LLVM_DEBUG({dbgs() << "About to erase PE_func_op\n";});
   PE_func_op->erase();
 }
 
