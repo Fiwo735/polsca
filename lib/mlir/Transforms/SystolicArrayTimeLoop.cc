@@ -31,6 +31,8 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/IR/Block.h"
+#include "llvm/ADT/BitVector.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -151,6 +153,23 @@ static std::string convertArgumentTypes(const std::vector<std::string>& argument
   return result;
 }
 
+static void printRegionInfo(Region &region, const std::string& info = "") {
+  LLVM_DEBUG({dbgs() << "----------------------" << info << "----------------------\n";});
+  LLVM_DEBUG({dbgs() << "Region with " << region.getBlocks().size() << " blocks:\n";});
+
+  for (Block &block : region.getBlocks()) {
+    LLVM_DEBUG({dbgs() << "\t" << "Block with " << block.getNumArguments() << " arguments, "
+        << block.getNumSuccessors() << " successors, and "
+        << block.getOperations().size() << " operations\n";});
+
+    for (Operation &op : block.getOperations()){
+      LLVM_DEBUG({dbgs() << "\t\t" << "Visiting op: '" << op.getName() << "' with "<< op.getNumOperands() << " operands and " << op.getNumResults() << " results\n";});
+    }
+  }
+
+  LLVM_DEBUG({dbgs() << "\n";});
+}
+
 static void handleCalleePE(mlir::FuncOp PE_func_op) {
   LLVM_DEBUG({dbgs() << " * FuncOp to handle:\n"; PE_func_op.dump();});
 
@@ -181,65 +200,55 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
 
   // Create a block in the new Func Op and add original arguments to it
   Block *block = b.createBlock(&newCallee.getBody());
-  for (auto argType : newArgTypes)
+  for (auto argType : newArgTypes) {
     block->addArgument(argType, newCallee.getLoc());
+  }
 
   // Add additional loops
   b.setInsertionPointToStart(block);
   AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
-  b.create<mlir::ReturnOp>(PE_func_op.getLoc());
 
   // Copy PE_func_op body into loop0 by inlining
   b.setInsertionPointToStart(loop0.getBody());
-  b.inlineRegionBefore(PE_func_op.getBody(), loop0.region(), loop0.region().end());
+  b.inlineRegionBefore(PE_func_op.getBody(), loop0.region(),  loop0.region().end());
+  printRegionInfo(loop0.region(), "After inlineRegionBefore");
+  LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
-  // Erase old (redundant) yield op that came from the original PE_func_op
-  oldRet->erase();
+  // Move affine yield (created by default during create<AffineForOp>) after the inlined region,
+  // i.e. to the end of outer loop body
+  for (Block &block : loop0.region().getBlocks()) {
+    block.getTerminator()->moveAfter(oldRet);
+    block.erase();
+    break;
+    // TODO instead of breaking we could have if statement checking getTerminator type
+    // return op -> moveafter + erase block | yield op -> moveafter ===> this would avoid saving and using oldRet
+  }
+  printRegionInfo(loop0.region(), "After moving yield op and erasing block 0");
+  LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
+
+  // Move old return op to the end of function call
+  oldRet->moveAfter(loop0);
+  printRegionInfo(loop0.region(), "After moving old return to the end of function");
+  LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Replace original value uses with new values
   auto i = 0;
-  for (auto arg : PE_func_op.getArguments()) {
+  for (auto arg : loop0.region().getArguments()) {
     arg.replaceAllUsesWith(newCallee.getArgument(i++));
   }
+  printRegionInfo(loop0.region(), "After replaceAllUsesWith");
+  LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
-  LLVM_DEBUG({dbgs() << " * New callee created:\n"; newCallee.dump();});
+  // Change outer affine for body block argument types to a single index
+  for (Block &block : loop0.region().getBlocks()) {
+    // Erase all existing block argument types (that came from the original FuncOP) using BitVector of all 1s
+    llvm::BitVector eraseIndices(block.getNumArguments(), true);
+    block.eraseArguments(eraseIndices);
 
-  // unsigned i = 0;
-  // for (auto arg : PE_func_op.getArguments()) {
-  //   arg.replaceAllUsesWith(newCallee.getArgument(i++));
-  // }
-
-  // b.setInsertionPointToStart(entry);
-
-  // Argument map.
-  // Block *loop_entry = b.createBlock(loop0.getBody());
-  // BlockAndValueMapping vmap;
-  // vmap.map(PE_func_op.getArguments(), newCallee.getArguments());
-  // // vmap.map(PE_func_op.getArguments(), loop_entry->getArguments());
-  // LLVM_DEBUG({dbgs() << "BlockAndValueMapping created\n";});
-
-  // // Iterate every operation in the original callee and clone it to the new one.
-  // b.setInsertionPointToStart(entry);
-  // for (Operation &op : PE_func_op.getBlocks().begin()->getOperations()) {
-  //   LLVM_DEBUG({dbgs() << "About to clone\n";});
-  //   if (isa<mlir::ReturnOp>(op))
-  //     continue;
-  //   b.clone(op, vmap);
-  // }
-
-  // Annotate each local variable with pragmas (e.g. resource or array partition if needed)
-  // newCallee.walk([&](Operation *op) {
-  //   // for (auto result : op->getResults()) {
-  //   //   // TODO how to give attributes to OpResult type?
-  //   //   result->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
-  //   // }
-  //   op->setAttr("phism.hls_pragma.resource", b.getUnitAttr());
-  // });
-
-
-
-
-
+    // Add one new block argument type of index for the affine for induction variable
+    block.addArgument(IndexType::get(context), newCallee.getLoc());
+  }
+  LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Add systolic array specific I/O
 
