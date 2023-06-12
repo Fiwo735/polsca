@@ -142,8 +142,19 @@ static std::vector<long int> parseVector(std::string param) {
   return vec;
 }
 
-static std::string pragmaGen(std::string pragma) {
+static std::string getStringFromAttribute(Attribute attribute) {
+  return attribute.dyn_cast<StringAttr>().getValue().str();
+}
+
+static std::string pragmaGen(const std::string& pragma) {
   return indent() + "#pragma HLS " + pragma + "\n";
+}
+
+static std::string pragmaGenIfAttrExists(Operation *op, const std::string& attr_name) {
+  if (!op->hasAttr(attr_name)) {
+    return "";
+  }
+  return pragmaGen(getStringFromAttribute(op->getAttr(attr_name)));
 }
 
 template <typename OpType>
@@ -787,9 +798,11 @@ static std::string emitOp(mlir::CallOp callOp) {
     callOpBuff += getValueName(result) + ", ";
   }
 
-  // Get rid of the last comma and space
-  callOpBuff.pop_back();
-  callOpBuff.pop_back();
+  // Get rid of the last comma and space unless the there were no arguments
+  if (callOp.getResults().size() > 0) {
+    callOpBuff.pop_back();
+    callOpBuff.pop_back();
+  }
 
   callOpBuff += ");\n";
 
@@ -1168,10 +1181,6 @@ static std::string declareValue(Value value) {
   return indent() + getTypeName(value) + " " + getValueName(value) + ";\n";
 }
 
-static std::string getStringFromAttribute(Attribute attribute) {
-  return attribute.dyn_cast<StringAttr>().getValue().str();
-}
-
 static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
   std::vector<std::string> type_names = {};
   
@@ -1202,6 +1211,11 @@ static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
 }
 
 static std::string emitOp(mlir::FuncOp funcOp) {
+  // Look for "no_emit" attribute
+  if (funcOp->hasAttr("phism.no_emit")) {
+    return "";
+  }
+
   // Pre-condition check
   checkFuncOp(funcOp);
 
@@ -1231,16 +1245,14 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   indent.add();
 
   // Emit HLS pragmas
-  if (funcOp->hasAttr("phism.hls_pragma.inline")) {
-    funcOpBuff += pragmaGen("INLINE OFF");
-  }
+  funcOpBuff += pragmaGenIfAttrExists(funcOp, "phism.hls_pragma");
 
   // Emit module index for PE
   if (funcOp->hasAttr("phism.pe"))
     funcOpBuff += indent() + "unsigned p = " + argName + "; // module index\n";
 
   // Collect all the local variables
-  funcOpBuff += indent() + "/* Local variable declaration */\n";
+  funcOpBuff += "\n" + indent() + "/* Local variable declaration */\n";
   funcOp.walk([&](Operation *op) {
     for (auto result : op->getResults()) {
       if (valueMap.count(result) == 1)
@@ -1298,7 +1310,14 @@ public:
     ModuleOp m = getOperation();
     // Torch-mlir must only emit a single function as the top-level function.
     auto i = 0;
-    m.walk([&](mlir::FuncOp op) { i++; });
+    m.walk([&](mlir::FuncOp op) {
+      // if (!op->hasAttr("phism.no_emit")) {
+      //   LLVM_DEBUG(dbgs() << "FuncOp found: " << op.getName() << "\n");
+      //   i++;
+      // }
+      LLVM_DEBUG(dbgs() << "FuncOp found: " << op.getName() << "\n");
+      i++;
+    });
     if (i != 1)
       m.emitError("Found more than one function in the module. Please "
                   "check which one for lowering.");
