@@ -151,9 +151,7 @@ static std::string pragmaGen(const std::string& pragma) {
 }
 
 static std::string pragmaGenIfAttrExists(Operation *op, const std::string& attr_name) {
-  if (!op->hasAttr(attr_name)) {
-    return "";
-  }
+  if (!op->hasAttr(attr_name)) return "";
   return pragmaGen(getStringFromAttribute(op->getAttr(attr_name)));
 }
 
@@ -329,14 +327,12 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
 //   Utils
 // ------------------------------------------------------
 
+// localName is used for local initialization in systolic arrays
+static std::string localName = "";
+
 static std::string getValueName(Value value) {
   if (valueMap.count(value) == 0) {
-    // TODO how to best implement it
-    // if (value.hasAttr("phism.hls_pragma.inline_off"))
-    if (false)
-      valueMap[value] = "v" + std::to_string(valueID++);
-    else
-      valueMap[value] = "v" + std::to_string(valueID++);
+    valueMap[value] = "v" + std::to_string(valueID++);
   }
 
   return valueMap[value];
@@ -713,10 +709,33 @@ static std::string emitOp(AffineForOp affineForOp) {
       upperBound += ", " + upperBoundPrinter.getAffineExpr(expr) + ")";
   }
 
-  return indent() + "for (" + getTypeName(iter) + " " + iterName + " = " +
-         lowerBound + "; " + iterName + " < " + upperBound + "; " + iterName +
-         " += " + std::to_string(step) + ") {\n" +
-         emitBlock(*affineForOp.getBody()) + indent() + "}\n";
+  std::string affineForOpBuff = indent() + "for (" + getTypeName(iter) + " " + iterName + " = " + lowerBound + "; ";
+  affineForOpBuff += iterName + " < " + upperBound + "; " + iterName + " += " + std::to_string(step) + ") {\n";
+
+  indent.add();
+  affineForOpBuff += pragmaGenIfAttrExists(affineForOp, "phism.hls_pragma");
+  indent.sub();
+
+  if (affineForOp->hasAttr("phism.include_union_hack")) {
+    indent.add();
+
+    affineForOpBuff += indent() + "union {unsigned int ui; float ut;} u;\n";
+    affineForOpBuff += indent() + "u.ui = (unsigned int) " + localName + "(31, 0);\n";
+    affineForOpBuff += indent() + "local_A[0][n] = u.ut;\n"; // TODO this line doesnt make sense yet, because it uses local_A[0][n]
+    affineForOpBuff += indent() + localName + " = " + localName + " >> 32;\n";
+
+    // TODO should everything be handled by the hack or some things are still emitted?
+    // affineForOpBuff += emitBlock(*affineForOp.getBody());
+
+    indent.sub();
+  } else {
+    affineForOpBuff += emitBlock(*affineForOp.getBody());
+  }
+
+  affineForOpBuff += indent() + "}\n";
+
+
+  return affineForOpBuff;
 }
 
 static std::string emitOp(AffineIfOp affineIfOp) {
@@ -781,30 +800,40 @@ static std::string emitOp(mlir::CallOp callOp) {
   std::string callOpBuff = "";
 
   // Emit the function call
-  callOpBuff += indent() + callOp.getCallee().str() + "(";
+  if (callOp->hasAttr("phism.hls_stream_read")) {
+    assert(callOp.getOperands().size() == 1 && "HLS stream read() must have one operand");
+    assert(callOp.getResults().size() == 1 && "HLS stream read() must have one result");
 
-  // Emit input arguments
-  for (auto arg : callOp.getOperands()) {
-    auto argName = getValueName(arg);
-    callOpBuff += argName + ", ";
+    localName = getValueName(callOp.getResults()[0]);
+    callOpBuff += indent() + localName + " = ";
+    callOpBuff += getValueName(callOp.getOperands()[0]) + ".read();\n";
+
+  } else {
+    callOpBuff += indent() + callOp.getCallee().str() + "(";
+
+    // Emit input arguments
+    for (auto arg : callOp.getOperands()) {
+      auto argName = getValueName(arg);
+      callOpBuff += argName + ", ";
+    }
+
+    // Emit output arguments
+    for (auto result : callOp.getResults()) {
+      // Pass address for scalar result arguments
+      if (!result.getType().isa<ShapedType>())
+        callOpBuff += "&";
+
+      callOpBuff += getValueName(result) + ", ";
+    }
+
+    // Get rid of the last comma and space unless the there were no arguments
+    if (callOp.getOperands().size() + callOp.getResults().size() > 0) {
+      callOpBuff.pop_back();
+      callOpBuff.pop_back();
+    }
+
+    callOpBuff += ");\n";
   }
-
-  // Emit output arguments
-  for (auto result : callOp.getResults()) {
-    // Pass address for scalar result arguments
-    if (!result.getType().isa<ShapedType>())
-      callOpBuff += "&";
-
-    callOpBuff += getValueName(result) + ", ";
-  }
-
-  // Get rid of the last comma and space unless the there were no arguments
-  if (callOp.getResults().size() > 0) {
-    callOpBuff.pop_back();
-    callOpBuff.pop_back();
-  }
-
-  callOpBuff += ");\n";
 
   return callOpBuff;
 }
@@ -1265,6 +1294,8 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   });
   funcOpBuff += "\n";
   indent.sub();
+
+  // TODO if I wanted to actually std.return something from funcop i would have to iterate over getresults()...
 
   // Emit funcOption body.
   funcOpBuff += emitBlock(funcOp.front());

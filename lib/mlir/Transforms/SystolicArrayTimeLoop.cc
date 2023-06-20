@@ -237,15 +237,18 @@ static void printRegionInfo(Region &region, const std::string& info = "") {
   LLVM_DEBUG({dbgs() << "\n";});
 }
 
-static mlir::FuncOp createDummyFuncOp(mlir::FuncOp current_func_op, std::string suffix, ConversionPatternRewriter& b){
+static unsigned dummy_func_op_ID = 0;
+
+static mlir::FuncOp createDummyFuncOp(mlir::FuncOp current_func_op, Type arg_type, Type res_type, std::string suffix, ConversionPatternRewriter& b){
   SmallVector<Type> func_result_types;
+  func_result_types.push_back(res_type);
   SmallVector<Type> func_arg_types;
-  // func_arg_types.push_back(IndexType::get(current_func_op.getContext())); // TODO use correct type
+  func_arg_types.push_back(arg_type);
 
   b.setInsertionPointAfter(current_func_op); // Insertion point right before the current Func Op
   FuncOp func_op = b.create<FuncOp>(
     current_func_op.getLoc(),
-    std::string(current_func_op.getName()) + "_" + suffix,
+    std::string(current_func_op.getName()) + "_" + suffix + "_" + std::to_string(dummy_func_op_ID++),
     b.getFunctionType(func_arg_types, func_result_types)
   );
   func_op->setAttr("phism.no_emit", b.getUnitAttr()); // TODO this could be added to constructor create
@@ -255,11 +258,47 @@ static mlir::FuncOp createDummyFuncOp(mlir::FuncOp current_func_op, std::string 
 
   Block *entry = func_op.addEntryBlock();
   b.setInsertionPointToStart(entry);
-  b.create<mlir::ReturnOp>(func_op.getLoc());
+  b.create<mlir::ReturnOp>(func_op.getLoc(), func_op.getArguments());
 
   LLVM_DEBUG({dbgs() << "Dummy func op after adding block with return op:\n"; func_op.dump();});
 
   return func_op;
+}
+
+static void initializeInputVariable(ConversionPatternRewriter &b, MLIRContext *context, Value v_in, FuncOp &callee, Block *innermost_block) {
+  // Add a dummy func op that won't be emitted directly, but allows for custom .read() call
+  memref::AllocaOp v_local = b.create<memref::AllocaOp>(callee.getLoc(), v_in.getType().cast<MemRefType>());
+  FuncOp hls_stream_read_func_op = createDummyFuncOp(callee, v_in.getType(), v_local.getType(), "hls_stream_read", b);
+
+  b.setInsertionPointToStart(innermost_block);
+  
+  SmallVector<Value> operands;
+  operands.push_back(v_in);
+
+  // Use a custom call op for reading from hls stream
+  CallOp hls_stream_read = b.create<CallOp>(
+    hls_stream_read_func_op.getLoc(),
+    hls_stream_read_func_op,
+    operands
+  );
+  hls_stream_read->setAttr("phism.hls_stream_read", b.getUnitAttr()); // TODO this could be added to constructor create
+  LLVM_DEBUG({dbgs() << "hls_stream_read:\n"; hls_stream_read.dump();});
+
+  // Add inner loop
+  AffineForOp inner_loop = b.create<AffineForOp>(callee.getLoc(), 0, 2, 1);
+  inner_loop->setAttr("phism.hls_pragma", StringAttr::get(context, "UNROLL")); // TODO this could be added to constructor create
+  inner_loop->setAttr("phism.include_union_hack", b.getUnitAttr());// TODO this could be added to constructor create
+  // Block *inner_block = b.createBlock(&inner_loop.getBody());
+  // inner_loop.getBody();
+  
+  // local_A[0][n] = u.ut; -> memref::store op from u to local_A + attrbitured with ".ut"
+  // store op takies vector of indexes, here: 0, n
+
+  // TODO maybe use actual MLIR for union hack by having a custom callop that gets emitted as the two lines of u.ui -> u.ut instead of emit hacks?
+
+  // TODO maybe use actual MLIR shift right instead of emit hacks?
+  // auto thirty_two = b.create<arith::ConstantOp>(callee.getLoc(), b.getI32IntegerAttr(32));
+  // arith::ShRUIOp shift_right_op = b.create<arith::ShRUIOp>(callee.getLoc(), hls_stream_read.getResults()[0], thirty_two);
 }
 
 static void handleCalleePE(mlir::FuncOp PE_func_op) {
@@ -308,8 +347,7 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   b.setInsertionPointToStart(loop0.getBody());
   b.inlineRegionBefore(PE_func_op.getBody(), loop0.region(),  loop0.region().end());
   // printRegionInfo(loop0.region(), "After inlineRegionBefore");
-  printOperation(loop0, "After inlineRegionBefore");
-  resetIndent();
+  printOperation(loop0, "After inlineRegionBefore"); resetIndent();
   LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Move affine yield (created by default during create<AffineForOp>) after the inlined region,
@@ -322,15 +360,12 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
     // return op -> moveafter + erase block | yield op -> moveafter ===> this would avoid saving and using oldRet
   }
   // printRegionInfo(loop0.region(), "After moving yield op and erasing block 0");
-  printOperation(loop0, "After moving yield op and erasing block 0");
-  resetIndent();
+  printOperation(loop0, "After moving yield op and erasing block 0"); resetIndent();
   LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Move old return op to the end of function call
   oldRet->moveAfter(loop0);
-  // printRegionInfo(loop0.region(), "After moving old return to the end of function");
-  printOperation(loop0, "After moving old return to the end of function");
-  resetIndent();
+  printOperation(loop0, "After moving old return to the end of function"); resetIndent();
   LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Replace original value uses with new values
@@ -338,22 +373,11 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
   for (auto arg : loop0.region().getArguments()) {
     arg.replaceAllUsesWith(newCallee.getArgument(i++));
   }
-  // printRegionInfo(loop0.region(), "After replaceAllUsesWith");
-  printOperation(loop0, "After replaceAllUsesWith");
-  resetIndent();
+  printOperation(loop0, "After replaceAllUsesWith"); resetIndent();
   LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
 
   // Change outer affine for body block argument types to a single index + find innermost affine for op
-  // AffineForOp* innermost_affine_for_op;
   for (Block &block : loop0.region().getBlocks()) {
-    // unsigned i = 0;
-    // block.walk([&](AffineForOp affine_for_op) {
-    //   innermost_affine_for_op = &affine_for_op;
-    //   i++;
-    //   LLVM_DEBUG({dbgs() << "Walking block, i: " << i << "\n";});
-    // });
-    // assert(i == 1 && "Found more than one AffineForOp in the PE.");
-
     // Erase all existing block argument types (that came from the original FuncOP) using BitVector of all 1s
     llvm::BitVector eraseIndices(block.getNumArguments(), true);
     block.eraseArguments(eraseIndices);
@@ -362,56 +386,28 @@ static void handleCalleePE(mlir::FuncOp PE_func_op) {
     block.addArgument(IndexType::get(context), newCallee.getLoc());
   }
   LLVM_DEBUG({dbgs() << "Callee:\n"; newCallee.dump();});
-  // LLVM_DEBUG({dbgs() << "innermost_affine_for_op: " << innermost_affine_for_op->getName() << "\n";});
-  // printRegionInfo(innermost_affine_for_op->region(), "Found AffineForOp");
   SmallVector<AffineForOp> affine_for_ops;
   loop0.walk([&](AffineForOp op) {
     affine_for_ops.push_back(op);
   });
   LLVM_DEBUG({dbgs() << "Found " << affine_for_ops.size() << " affineForOps\n";});
   AffineForOp innermost_affine_for_op = affine_for_ops[0];
-  printOperation(innermost_affine_for_op, "Found AffineForOp");
-  resetIndent();
-
-  // Add systolic array specific I/O
-  // Add a dummy func op that won't be emitted directly, but allows for custom .read() call
-  mlir::FuncOp hls_stream_read_func_op = createDummyFuncOp(newCallee, "hls_stream_read", b);
+  printOperation(innermost_affine_for_op, "Found AffineForOp"); resetIndent();
 
   // Find innermost block
-  Block* innermost_block;
-  for (Region &region : innermost_affine_for_op->getRegions()) { // TODO how to do this efficiently?
-    for (Block &block : region.getBlocks()) {
-      innermost_block = &block;
-      break;
-    }
-    break;
-  }
-  printBlock(*innermost_block, "Found innermost_block");
-  resetIndent();
+  Block* innermost_block = &(innermost_affine_for_op->getRegions().front().getBlocks().front());
+  printBlock(*innermost_block, "Found innermost_block"); resetIndent();
   LLVM_DEBUG({dbgs() << "Found innermost_block: \n";});
 
+  // Add systolic array specific I/O
   // 1. Load A_in to A_local
-  auto A_in = newCallee.getArguments()[3];
-  b.setInsertionPointToStart(innermost_block);
-  memref::AllocaOp A_local = b.create<memref::AllocaOp>(newCallee.getLoc(), A_in.getType().cast<MemRefType>());
-  // use a custom call op for reading from hls stream
-  SmallVector<Value> operands;
-  CallOp hls_stream_read = b.create<CallOp>(
-    hls_stream_read_func_op.getLoc(),
-    hls_stream_read_func_op,
-    operands
-  );
-
+  Value A_in = newCallee.getArguments()[3];
+  initializeInputVariable(b, context, A_in, newCallee, innermost_block);
   
-
-
-  // attr per op -> but better to infer from func ops
-  // A_local.setAttr("requires .read()")
-
-  // local_A[0][n] = u.ut; -> memref::store op from u to local_A + attrbitured with ".ut"
-  // store op takies vector of indexes, here: 0, n
-
   // 2. Load B_in to B_local
+  Value B_in = newCallee.getArguments()[4];
+  initializeInputVariable(b, context, B_in, newCallee, innermost_block);
+
   // 3. C_local := op(A_local, B_local) or 0
   // 4. C_local drain to C_out
   // 5. Drain B_local to B_out
