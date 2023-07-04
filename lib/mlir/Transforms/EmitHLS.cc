@@ -3,6 +3,7 @@
 // This file implements passes that emits HLS code from the given MLIR code.
 //
 //===----------------------------------------------------------------------===//
+#include <regex>
 
 #include "PassDetail.h"
 
@@ -52,6 +53,7 @@ static auto blockID = 0;
 static auto valueID = 0;
 static llvm::DenseMap<Value, std::string> valueMap;
 static llvm::DenseMap<Block *, std::string> blockMap;
+static llvm::DenseMap<Value, std::string> pragmaMap;
 
 // ------------------------------------------------------
 //  Inferring variable types
@@ -146,6 +148,7 @@ static std::string getStringFromAttribute(Attribute attribute) {
   return attribute.dyn_cast<StringAttr>().getValue().str();
 }
 
+// TODO this should handle multiple pragmas, so list of strings and not just string
 static std::string pragmaGen(const std::string& pragma) {
   return indent() + "#pragma HLS " + pragma + "\n";
 }
@@ -153,6 +156,11 @@ static std::string pragmaGen(const std::string& pragma) {
 static std::string pragmaGenIfAttrExists(Operation *op, const std::string& attr_name) {
   if (!op->hasAttr(attr_name)) return "";
   return pragmaGen(getStringFromAttribute(op->getAttr(attr_name)));
+}
+
+static std::string pragmaGenIfAttrExists(Operation *op, const std::string& attr_name, std::regex re, const std::string& repl) {
+  if (!op->hasAttr(attr_name)) return "";
+  return std::regex_replace(pragmaGen(getStringFromAttribute(op->getAttr(attr_name))), re, repl);
 }
 
 template <typename OpType>
@@ -330,9 +338,13 @@ static void initArgTypeMap(mlir::FuncOp funcOp, std::string hlsParam) {
 // localName is used for local initialization in systolic arrays
 static std::string localName = "";
 
-static std::string getValueName(Value value) {
+static std::string getValueName(Value value, const std::string &prefix = "v") {
   if (valueMap.count(value) == 0) {
-    valueMap[value] = "v" + std::to_string(valueID++);
+    auto *op = value.getDefiningOp();
+    if (op && op->hasAttr("phism.variable_name"))
+      valueMap[value] = getStringFromAttribute(op->getAttr("phism.variable_name"));
+    else
+      valueMap[value] = prefix + std::to_string(valueID++);
   }
 
   return valueMap[value];
@@ -349,6 +361,10 @@ static std::string getTypeName(Value value) {
   // if (dyn_cast<BlockArgument>(value)) // seems to be newer LLVM version
   // if (value.dyn_cast<BlockArgument>())
   //   return unitTypeMap[value];
+
+  if (auto op = value.getDefiningOp())
+    if (op->hasAttr("phism.type_name"))
+      return getStringFromAttribute(op->getAttr("phism.type_name"));
 
   auto valueType = value.getType();
   // if (auto arrayType = dyn_cast<ShapedType>(valueType))
@@ -404,7 +420,7 @@ static std::string getConstantOperand(Type type, Attribute attr) {
   return constValue;
 }
 
-static std::string getArrayInit(Value array) {
+static std::string getArrayInit(Value array, const std::string &prefix = "v") {
 
   auto arrayType = array.getType().dyn_cast<ShapedType>();
 
@@ -414,12 +430,12 @@ static std::string getArrayInit(Value array) {
 
   std::string arrayBuff;
   if (arrayType.hasStaticShape()) {
-    arrayBuff += getValueName(array);
+    arrayBuff += getValueName(array, prefix);
     for (auto &shape : arrayType.getShape())
       arrayBuff += "[" + std::to_string(shape) + "]";
   } else
     // Treat it as a pointer
-    arrayBuff += "*" + getValueName(array);
+    arrayBuff += "*" + getValueName(array, prefix);
 
   return arrayBuff;
 }
@@ -631,7 +647,7 @@ static std::string emitBlock(Block &block);
 
 static std::string emitOp(scf::ForOp forOp) {
   auto iter = forOp.getInductionVar();
-  auto iterName = getValueName(iter);
+  auto iterName = getValueName(iter, "i");
   // auto lowerBound = forOp.getLowerBound(); // used in newer LLVM
   auto lowerBound = forOp.lowerBound();
   // auto upperBound = forOp.getUpperBound(); // used in newer LLVM
@@ -651,16 +667,13 @@ static std::string emitOp(scf::IfOp ifOp) {
   auto cond = ifOp.condition();
   std::string ifBuff;
 
-  ifBuff = indent() + "if (" + getValueName(cond) + ") {" +
-          //  emitBlock(ifOp.getThenRegion().front()); // used in newer LLVM
-           emitBlock(ifOp.thenRegion().front());
-  // if (!ifOp.getElseRegion().empty()) { // used in newer LLVM
+  ifBuff = indent() + "if (" + getValueName(cond) + ") {\n" + emitBlock(ifOp.thenRegion().front());
+
   if (!ifOp.elseRegion().empty()) {
-    // ifBuff += "} else {\n" + emitBlock(ifOp.getElseRegion().front()); // used in newer LLVM
-    ifBuff += "} else {\n" + emitBlock(ifOp.elseRegion().front());
+    ifBuff += indent() + "} else {\n" + indent() + emitBlock(ifOp.elseRegion().front());
   }
 
-  ifBuff += "}\n";
+  ifBuff += indent() + "}\n";
   return ifBuff;
 }
 
@@ -678,7 +691,7 @@ static std::string emitOp(scf::YieldOp yieldOp) {
 
 static std::string emitOp(AffineForOp affineForOp) {
   auto iter = affineForOp.getInductionVar();
-  auto iterName = getValueName(iter);
+  auto iterName = getValueName(iter, "i");
   auto step = affineForOp.getStep();
 
   std::string lowerBound;
@@ -799,15 +812,32 @@ static std::string emitOp(AffineYieldOp affineYieldOp) {
 static std::string emitOp(mlir::CallOp callOp) {
   std::string callOpBuff = "";
 
+  // If present then start with reverse union hack
+  if (callOp->hasAttr("phism.include_reverse_union_hack")) {
+    assert(callOp.getOperands().size() == 2 && "CallOp must have 2 operands for include_reverse_union_hack");
+    localName = getValueName(callOp.getOperands()[1]);
+
+    callOpBuff += indent() + "union {unsigned int ui; float ut;} u1, u0;\n";
+    callOpBuff += indent() + "u1.ut = local_A[0][1];\n";
+    callOpBuff += indent() + "u0.ut = local_A[0][0];\n";
+    callOpBuff += indent() + localName + " = (ap_uint<32>(u1.ui), ap_uint<32>(u0.ui));\n";
+  } 
+
   // Emit the function call
   if (callOp->hasAttr("phism.hls_stream_read")) {
-    assert(callOp.getOperands().size() == 1 && "HLS stream read() must have one operand");
-    assert(callOp.getResults().size() == 1 && "HLS stream read() must have one result");
+    assert(callOp.getOperands().size() == 1 && "HLS stream read() must have 1 operand");
+    assert(callOp.getResults().size() == 1 && "HLS stream read() must have 1 result");
 
     localName = getValueName(callOp.getResults()[0]);
     callOpBuff += indent() + localName + " = ";
     callOpBuff += getValueName(callOp.getOperands()[0]) + ".read();\n";
 
+  } else if (callOp->hasAttr("phism.hls_stream_write")) {
+    assert(callOp.getOperands().size() == 2 && "HLS stream write() must have 2 operands");
+    // assert(callOp.getResults().size() == 1 && "HLS stream write() must have 1 result"); // TODO
+
+    callOpBuff += indent() + getValueName(callOp.getOperands()[0]) + ".write(";
+    callOpBuff += getValueName(callOp.getOperands()[1]) + ");\n";
   } else {
     callOpBuff += indent() + callOp.getCallee().str() + "(";
 
@@ -906,10 +936,14 @@ static std::string emitBlock(Block &block) {
       continue;
     }
     // Memref init is emitted when declaring the variable
-    if (dyn_cast<memref::AllocOp>(op))
+    if (auto castOp = dyn_cast<memref::AllocOp>(op)) {
+      pragmaMap[castOp] = pragmaGenIfAttrExists(castOp, "phism.hls_pragma");
       continue;
-    if (dyn_cast<memref::AllocaOp>(op))
+    }
+    if (auto castOp = dyn_cast<memref::AllocaOp>(op)) {
+      pragmaMap[castOp] = pragmaGenIfAttrExists(castOp, "phism.hls_pragma");
       continue;
+    }
 
     // Arith Ops
     // if (auto castOp = dyn_cast<arith::SelectOp>(op)) { // seems to belong to mlir:: in older LLVM
@@ -1176,38 +1210,44 @@ static void checkFuncOp(mlir::FuncOp funcOp) {
 }
 
 static std::string declareValue(Value value) {
-  std::string valueBuff;
   auto type = value.getType();
+  std::string declaration = indent() + getTypeName(value) + " ";
+  bool isShapedType = (type.dyn_cast<ShapedType>() != nullptr);
+  std::string variableName;
 
-  // If it is a constant op, we initiliase it while declaring the
-  // variable.
+  // If it is a constant op, we initiliase it while declaring the variable.
   if (auto constantOp = dyn_cast<arith::ConstantOp>(value.getDefiningOp())) {
-    // if (dyn_cast<ShapedType>(type)) { // seems to be newer LLVM
-    if (type.dyn_cast<ShapedType>()) {
-      valueBuff += indent() + getTypeName(value) + " " + getArrayInit(value) + " = {";
+    if (isShapedType) {
+      variableName = getArrayInit(value, "ca");
+      declaration += variableName + " = {";
 
-      // auto denseAttr = dyn_cast<DenseElementsAttr>(constantOp.getValue()); // seems to be newer LLVM
       auto denseAttr = constantOp.getValue().dyn_cast<DenseElementsAttr>();
       assert(denseAttr);
 
       for (auto element : denseAttr.getValues<Attribute>()) {
         auto constantValue = getConstantOperand(type, element);
         assert(!constantValue.empty());
-        valueBuff += constantValue + ",";
+        declaration += constantValue + ",";
       }
-      valueBuff.pop_back();
-      valueBuff += "};\n";
-      return valueBuff;
-    } else
-      return indent() + getTypeName(value) + " " + getValueName(value) + " = " +
-             getConstantOperand(constantOp.getType(), constantOp.getValue()) +
-             ";\n";
+      declaration.pop_back();
+      declaration += "}";
+    } else {
+      variableName = getValueName(value, "c");
+      declaration += variableName + " = " + getConstantOperand(constantOp.getType(), constantOp.getValue());
+    }
   }
 
-  // if (dyn_cast<ShapedType>(value.getType())) // seems to be newer LLVM
-  if (value.getType().dyn_cast<ShapedType>())
-    return indent() + getTypeName(value) + " " + getArrayInit(value) + ";\n";
-  return indent() + getTypeName(value) + " " + getValueName(value) + ";\n";
+  else {
+    variableName = (isShapedType ? getArrayInit(value, "a") : getValueName(value, "v"));
+    declaration += variableName;
+  }
+
+  // Removes array initialization, i.e. var[2][4] -> var, as HLS pragma only requires variable name
+  variableName = std::regex_replace(variableName, std::regex("\\[[0-9]+\\]+"), "");
+  declaration += ";\n" + pragmaGenIfAttrExists(value.getDefiningOp(), "phism.hls_pragma", std::regex("\\$"), variableName);
+
+  return declaration;
+
 }
 
 static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
@@ -1263,7 +1303,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
     //   llvm_unreachable("Function arg has scalar type. This is not supported.");
     // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
     type_name = type_names[arg.index()];
-    argName = (arg.value().getType().dyn_cast<ShapedType>()) ? getArrayInit(arg.value()) : getValueName(arg.value());
+    argName = (arg.value().getType().dyn_cast<ShapedType>()) ? getArrayInit(arg.value(), "pa") : getValueName(arg.value(), "p");
     funcOpBuff += type_name + " " + argName + ", ";
   }
   // Get rid of the last comma and space
@@ -1288,8 +1328,6 @@ static std::string emitOp(mlir::FuncOp funcOp) {
         op->emitError(" has been declared.");
 
       funcOpBuff += declareValue(result);
-      if (funcOp->hasAttr("phism.pe"))
-        funcOpBuff += pragmaGen("RESOURCE TODO");
     }
   });
   funcOpBuff += "\n";
@@ -1299,7 +1337,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
 
   // Emit funcOption body.
   funcOpBuff += emitBlock(funcOp.front());
-  funcOpBuff += "}\n";
+  funcOpBuff += "}\n\n\n";
   return funcOpBuff;
 }
 
@@ -1320,7 +1358,7 @@ static void emitIncludes(raw_ostream &os) {
 }
 
 static LogicalResult emitHLS(mlir::FuncOp funcOp, raw_ostream &os) {
-  os << emitOp(funcOp) << "\n\n";
+  os << emitOp(funcOp);
   return success();
 }
 
