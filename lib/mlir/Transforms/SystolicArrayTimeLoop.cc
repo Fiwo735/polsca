@@ -3,7 +3,6 @@
 // This file implements passes that TODO
 //
 //===----------------------------------------------------------------------===//
-
 #include "PassDetail.h"
 
 #include "phism/mlir/Transforms/PhismTransforms.h"
@@ -126,40 +125,8 @@ void printOperation(Operation *op, const std::string& info/*= ""*/) {
     printRegion(region);
 }
 
-static bool isNumberString(std::string s) {
-  std::string::const_iterator it = s.begin();
-  while (it != s.end() && std::isdigit(*it))
-    ++it;
-  return !s.empty() && it == s.end();
-}
-
-template <typename OpType>
-static bool areVecSame(std::vector<OpType> &v1, std::vector<OpType> &v2) {
-  if (v1.size() != v2.size())
-    return false;
-  return std::equal(v1.begin(), v1.begin() + v1.size(), v2.begin());
-}
-
-static int countSubstring(std::string pat, std::string txt) {
-  int M = pat.length();
-  int N = txt.length();
-  int res = 0;
-
-  /* A loop to slide pat[] one by one */
-  for (int i = 0; i <= N - M; i++) {
-    /* For current index i, check for
-       pattern match */
-    int j;
-    for (j = 0; j < M; j++)
-      if (txt[i + j] != pat[j])
-        break;
-
-    // if pat[0...M-1] = txt[i, i+1, ...i+M-1]
-    if (j == M) {
-      res++;
-    }
-  }
-  return res;
+static inline std::string makeHLSStream(const std::string &t) {
+  return "hls::stream<" + t + ">";
 }
 
 // TODO llvm::DenseMap?
@@ -183,6 +150,9 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
   for (auto arg : PE_call_op.getOperands())
     operands.push_back(arg);
 
+  operands.push_back(PE_call_op.getOperands()[3]);
+  operands.push_back(PE_call_op.getOperands()[4]);
+
   Value some_constant = b.create<arith::ConstantIndexOp>(PE_call_op.getLoc(), 123);
   operands.push_back(some_constant);
 
@@ -201,14 +171,10 @@ static void handleCallerPE(mlir::CallOp PE_call_op) {
 
   // Erase original CallOp
   PE_call_op->erase();
-
-
 }
 
 // TODO this could be done better with stringstream
-static std::string convertArgumentTypes(const std::vector<std::string>& argument_types) {
-  char delimiter = '.';
-
+static std::string vec2str(const std::vector<std::string>& argument_types, char delimiter = '.') {
   std::string result = "";
   for (const auto &argument_type: argument_types) {
     result += argument_type + delimiter;
@@ -258,7 +224,7 @@ static FuncOp createDummyFuncOp(FuncOp current_func_op, SmallVector<Type> arg_ty
 
   Block *entry = func_op.addEntryBlock();
   b.setInsertionPointToStart(entry);
-  b.create<mlir::ReturnOp>(func_op.getLoc(), func_op.getArguments()[0]); // TODO this could be a void function, i.e. w/o ReturnOp?
+  b.create<ReturnOp>(func_op.getLoc(), func_op.getArguments()[0]); // TODO this could be a void function, i.e. w/o ReturnOp?
 
   LLVM_DEBUG({dbgs() << "Dummy func op after adding block with return op:\n"; func_op.dump();});
 
@@ -266,17 +232,20 @@ static FuncOp createDummyFuncOp(FuncOp current_func_op, SmallVector<Type> arg_ty
   return func_op;
 }
 
-static Value initializeInputVariable(ConversionPatternRewriter &b, MLIRContext *context, Value v_in, FuncOp &callee, const std::string &variable_name) {
+static Value initializeInputVariable(ConversionPatternRewriter &b, MLIRContext *context, Value v_in, FuncOp &callee,
+                                     const std::string &variable_name, const std::string &type_name) {
   // Add a dummy func op that won't be emitted directly, but allows for custom .read() call
   memref::AllocaOp v_local = b.create<memref::AllocaOp>(callee.getLoc(), v_in.getType().cast<MemRefType>());
   v_local->setAttr("phism.hls_pragma", StringAttr::get(context, "ARRAY_PARTITION variable=$ dim=0 complete"));
   v_local->setAttr("phism.variable_name", StringAttr::get(context, variable_name));
+  v_local->setAttr("phism.type_name", StringAttr::get(context, type_name));
+
   FuncOp hls_stream_read_func_op = createDummyFuncOp(callee, {v_in.getType()}, {v_local.getType()}, "hls_stream_read", b);
 
   SmallVector<Value> operands{v_in};
 
   // Use a custom call op for reading from hls stream
-  llvm::ArrayRef<std::pair<mlir::StringAttr, mlir::Attribute>> ppp{getStringAttrPair("phism.hls_stream_read", b)};
+  // llvm::ArrayRef<std::pair<mlir::StringAttr, mlir::Attribute>> ppp{getStringAttrPair("phism.hls_stream_read", b)};
   CallOp hls_stream_read = b.create<CallOp>(
     hls_stream_read_func_op.getLoc(),
     // hls_stream_read_func_op->getResultTypes(),
@@ -286,6 +255,8 @@ static Value initializeInputVariable(ConversionPatternRewriter &b, MLIRContext *
   );
   hls_stream_read->setAttr("phism.hls_stream_read", b.getUnitAttr()); // TODO this could be added to constructor create
   LLVM_DEBUG({dbgs() << "hls_stream_read:\n"; hls_stream_read.dump();});
+
+  hls_stream_read.getResults()[0].getDefiningOp()->setAttr("phism.type_name", StringAttr::get(context, type_name));
 
   // Add inner loop
   AffineForOp inner_loop = b.create<AffineForOp>(callee.getLoc(), 0, 2, 1);
@@ -300,24 +271,26 @@ static Value initializeInputVariable(ConversionPatternRewriter &b, MLIRContext *
   // TODO maybe use actual MLIR for union hack by having a custom callop that gets emitted as the two lines of u.ui -> u.ut instead of emit hacks?
 
   // TODO maybe use actual MLIR shift right instead of emit hacks?
-  // auto thirty_two = b.create<arith::ConstantOp>(callee.getLoc(), b.getI32IntegerAttr(32));
+  // b.setInsertionPointToStart(inner_loop.getBody());
+  // arith::ConstantIndexOp thirty_two = b.create<arith::ConstantIndexOp>(callee.getLoc(), 32);
   // arith::ShRUIOp shift_right_op = b.create<arith::ShRUIOp>(callee.getLoc(), hls_stream_read.getResults()[0], thirty_two);
+
   b.setInsertionPointAfter(inner_loop);
   return v_local;
 }
 
-static Block* findInnermostBlock(AffineForOp for_op) {
-  SmallVector<AffineForOp> affine_for_ops;
-  for_op.walk([&](AffineForOp op) {
-    affine_for_ops.push_back(op);
-  });
-  LLVM_DEBUG({dbgs() << "Found " << affine_for_ops.size() << " affineForOps\n";});
-  AffineForOp innermost_affine_for_op = affine_for_ops[0];
-  printOperation(innermost_affine_for_op, "Found AffineForOp"); resetIndent();
+// static Block* findInnermostBlock(AffineForOp for_op) {
+//   SmallVector<AffineForOp> affine_for_ops;
+//   for_op.walk([&](AffineForOp op) {
+//     affine_for_ops.push_back(op);
+//   });
+//   LLVM_DEBUG({dbgs() << "Found " << affine_for_ops.size() << " affineForOps\n";});
+//   AffineForOp innermost_affine_for_op = affine_for_ops[0];
+//   printOperation(innermost_affine_for_op, "Found AffineForOp"); resetIndent();
 
-  // Find innermost block
-  return &(innermost_affine_for_op->getRegions().front().getBlocks().front());
-}
+//   // Find innermost block
+//   return &(innermost_affine_for_op->getRegions().front().getBlocks().front());
+// }
 
 static void reduceBlockArguments(Block &block, Type new_type, Location loc) {
   llvm::BitVector eraseIndices(block.getNumArguments(), true);
@@ -338,11 +311,11 @@ static void propagateUses(AffineForOp for_loop, FuncOp func_op, Type block_argum
 static CallOp createWriteCallOp(ConversionPatternRewriter &b, Value from, Value to, FuncOp &callee) {
   FuncOp hls_stream_write_func_op = createDummyFuncOp(callee, {to.getType(), from.getType()}, {from.getType()}, "hls_stream_write", b);
 
-  SmallVector<Value> operands{to, from}; // TODO what operands to use to avoid UNKNOWN SSA VALUE?
+  SmallVector<Value, 2> operands{to, from};
 
   // Use a custom call op for writing to hls_stream
   CallOp hls_stream_write = b.create<CallOp>(
-    // newCallee.getLoc(), // TODO which to use?
+    // callee.getLoc(), // TODO which to use?
     hls_stream_write_func_op.getLoc(),
     hls_stream_write_func_op,
     operands
@@ -368,9 +341,12 @@ static scf::IfOp createIfWithConstantConditions(ConversionPatternRewriter &b, Lo
   return compute_if;
 }
 
+static llvm::simple_ilist<mlir::Operation>::iterator getFirstOp(AffineForOp op) {
+  return op.region().getBlocks().front().getOperations().begin();
+}
+
 static void handleCalleePE(FuncOp PE_func_op) {
-  std::string IO_type = "IO_t";
-  std::string local_type = "local_t";
+  std::string IO_type = "ap_fixed<64,32>";
 
   LLVM_DEBUG({dbgs() << " * FuncOp to handle:\n"; PE_func_op.dump();});
 
@@ -385,8 +361,11 @@ static void handleCalleePE(FuncOp PE_func_op) {
   for (auto arg : PE_func_op.getArguments()) {
     newArgTypes.push_back(arg.getType());
   }
+  newArgTypes.push_back(PE_func_op.getArguments()[3].getType());
+  newArgTypes.push_back(PE_func_op.getArguments()[4].getType());
   // TODO this is last argument and not first to avoid conflicts when changing order of argument usage,
   // i.e. operations in blocks still refer to the old argument order
+  // TODO maybe this could be made into first argument
   newArgTypes.push_back(IndexType::get(context));
   
   // New callee function type.
@@ -398,31 +377,39 @@ static void handleCalleePE(FuncOp PE_func_op) {
     newFuncType
   );
 
+  Location loc = newCallee.getLoc();
+
   // Create a block in the new Func Op and add original arguments to it
   Block *block = b.createBlock(&newCallee.getBody());
   for (auto argType : newArgTypes) {
-    block->addArgument(argType, newCallee.getLoc());
+    block->addArgument(argType, loc);
   }
 
   // Add additional loops
   b.setInsertionPointToStart(block);
-  AffineForOp loop0 = b.create<AffineForOp>(PE_func_op.getLoc(), 0, 100, 5);
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 2, 1);
+
+  b.setInsertionPointToStart(loop0.getBody());
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+
+  b.setInsertionPointToStart(loop1.getBody());
+  AffineForOp loop2 = b.create<AffineForOp>(loc, 0, 2, 1);
+
+  b.setInsertionPointToStart(loop2.getBody());
+  AffineForOp loop3 = b.create<AffineForOp>(loc, 0, 8, 1);
+
+  b.setInsertionPointToStart(loop3.getBody());
+  AffineForOp loop4 = b.create<AffineForOp>(loc, 0, 8, 1);
+
+  b.setInsertionPointToStart(loop4.getBody());
+  AffineForOp loop5 = b.create<AffineForOp>(loc, 0, 8, 1);
+
+  loop5->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
 
   // 3. C_local := op(A_local, B_local) or 0
-  b.setInsertionPointToStart(loop0.getBody());
-  // TODO how to handle if statements from scratch?
-  // If condition for zeroing C_local
-  // Value induction_var = innermost_affine_for_op.getInductionVar();
-  // SmallVector<Value> if_operands;
-  // if_operands.push_back(induction_var);
-  // IntegerSet if_set;
-  // LLVM_DEBUG({dbgs() << "if_set:" << if_set << "\n";});
-  // llvm::BitVector indices(1, true);
-  // IntegerSet if_set2 = IntegerSet::get(1, 1, indices);
-  // LLVM_DEBUG({dbgs() << "Before C_local if\n";});
-  // AffineIfOp zero_C_if = b.create<AffineIfOp>(newCallee.getLoc(), if_set, if_operands, /*withElseRegion=*/false);
-  // LLVM_DEBUG({dbgs() << "After C_local if:" << zero_C_if << "\n";});
-  AffineForOp compute_loop = b.create<AffineForOp>(newCallee.getLoc(), 0, 500, 1);
+  // b.setInsertionPointToStart(loop0.getBody());
+  b.setInsertionPointToStart(loop5.getBody());
+  AffineForOp compute_loop = b.create<AffineForOp>(loc, 0, 2, 1);
   compute_loop->setAttr("phism.hls_pragma", StringAttr::get(context, "UNROLL")); // TODO this could be added to constructor create
 
   // Copy PE_func_op body into loop0 by inlining
@@ -460,55 +447,133 @@ static void handleCalleePE(FuncOp PE_func_op) {
   b.setInsertionPoint(compute_loop);
   // 1. Load A_in to A_local
   Value A_in = newCallee.getArguments()[3];
-  Value A_local = initializeInputVariable(b, context, A_in, newCallee, "local_A");
+  Value A_local = initializeInputVariable(b, context, A_in, newCallee, "local_A", IO_type);
   LLVM_DEBUG({dbgs() << "A_in -> A_local done\n";});
+  // memref::LoadOp loaded = b.create<memref::LoadOP>(loc, ); // TODO maybe LoadOp with custom attribute to make it into .read() would make more sense?
   
   // 2. Load B_in to B_local
   Value B_in = newCallee.getArguments()[4];
-  Value B_local = initializeInputVariable(b, context, B_in, newCallee, "local_B");
+  Value B_local = initializeInputVariable(b, context, B_in, newCallee, "local_B", IO_type);
   LLVM_DEBUG({dbgs() << "B_in -> B_local done\n";});
 
   printOperation(newCallee, "newCallee after steps 1. and 2.");
 
   
   // 3. Zeroing condition for compute operation
-  scf::IfOp compute_if = createIfWithConstantConditions(b, newCallee.getLoc(), {{loop0.getInductionVar(), 0}, {loop0.getInductionVar(), 0}});
-  memref::AllocaOp C_local = b.create<memref::AllocaOp>(newCallee.getLoc(), newCallee.getArguments()[0].getType().cast<MemRefType>());
-  C_local->setAttr("phism.variable_name", StringAttr::get(context, "local_C"));
+  // SmallVector<Value, 4> lbOperands(loop2.getLowerBoundOperands());
+  // LLVM_DEBUG({dbgs() << "loop2.getLowerBoundOperands() obtained\n";});
+  // for (auto v : lbOperands) {
+  //   LLVM_DEBUG({dbgs() << "loop2.getLowerBoundOperands(): " << v << "\n";});
+  // }
 
-  arith::ConstantIntOp i_zero = b.create<arith::ConstantIntOp>(newCallee.getLoc(), 15, 32);
-  arith::ConstantIndexOp i0 = b.create<arith::ConstantIndexOp>(newCallee.getLoc(), 5432);
-  SmallVector<Value, 8> idxs = {i0, i0};
-  // SmallVector<Value, 8> idxs = {loop0.getInductionVar(), loop0.getInductionVar()};
-  // memref::StoreOp C_local_store = b.create<memref::StoreOp>(newCallee.getLoc(), i_zero, C_local, idxs);
+  // auto lbMap = loop3.getLowerBoundMap();
+  // LLVM_DEBUG({dbgs() << "loop3.getLowerBoundMap() obtained: " << lbMap << "\n";});
+  // auto ubMap = loop3.getUpperBoundMap();
+  // LLVM_DEBUG({dbgs() << "loop3.getUpperBoundMap() obtained: " << ubMap << "\n";});
+
+  // LLVM_DEBUG({dbgs() << "loop3.getLowerBound() obtained: " << loop3.getLowerBound().getOperand(0) << "\n";});
+  // LLVM_DEBUG({dbgs() << "loop3.getUpperBound() obtained: " << loop3.getUpperBound().getOperand(0) << "\n";});
+
+  // SmallVector<Value, 4> ubOperands(loop2.getUpperBoundOperands());
+  // for (auto v : ubOperands) {
+  //   LLVM_DEBUG({dbgs() << "loop2.getUpperBoundOperands(): " << v << "\n";});
+  // }
+
+  // TODO how to obtain numerical value of lower and upper bound of affine for op?
+
+  scf::IfOp compute_if = createIfWithConstantConditions(b, loc, {{loop2.getInductionVar(), 0}, {loop3.getInductionVar(), 0}});
+  memref::AllocaOp C_local = b.create<memref::AllocaOp>(loc, newCallee.getArguments()[0].getType().cast<MemRefType>());
+  C_local->setAttr("phism.variable_name", StringAttr::get(context, "local_C"));
+  C_local->setAttr("phism.type_name", StringAttr::get(context, IO_type));
+
+  // arith::ConstantIntOp i_zero = b.create<arith::ConstantIntOp>(loc, 15, 32);
+  // arith::ConstantIndexOp i0 = b.create<arith::ConstantIndexOp>(loc, 5432);
+  // SmallVector<Value, 2> idxs = {i0, i0};
+  // SmallVector<Value, 2> idxs = {loop0.getInductionVar(), loop0.getInductionVar()};
+  // memref::StoreOp C_local_store = b.create<memref::StoreOp>(loc, i_zero, C_local, idxs);
   // TODO debug above 'memref.store' op failed to verify that type of 'value' matches element type of 'memref'
+
+  // TODO temporary solution
+  compute_if->setAttr("phism.zero_local_C", b.getUnitAttr());
+
+  // Modify compute loop insides
+  printBlock(compute_loop.region().getBlocks().front(), "compute loop before:");
+
+  // Delete zero initializing as it's already handled (in reverse order to avoid ever being in an illegal state)
+  (++getFirstOp(compute_loop))->erase();
+  getFirstOp(compute_loop)->erase();
+  printBlock(compute_loop.region().getBlocks().front(), "compute loop after erasing zero initializing:");
+
+  // Replace uses in original computation with new SA variables
+  AffineForOp inner_compute_loop = dyn_cast<AffineForOp>(*getFirstOp(compute_loop));
+  LLVM_DEBUG({dbgs() << "*getFirstOp(inner_compute_loop):" << *getFirstOp(inner_compute_loop) << "\n";});
+  LLVM_DEBUG({dbgs() << "*(++getFirstOp(inner_compute_loop)):" << *(++getFirstOp(inner_compute_loop)) << "\n";});
+  
+  // getFirstOp(inner_compute_loop)->replaceAllUsesWith(C_local); // This works
+
+  // (++getFirstOp(inner_compute_loop))->replaceAllUsesWith(A_local); // TODO This doesn't work -> why?
+  // (++(++getFirstOp(inner_compute_loop)))->replaceAllUsesWith(B_local);
+
+
+
+  printBlock(compute_loop.region().getBlocks().front(), "compute loop after replaceAllUsesWith:");
+
+  // static void reduceBlockArguments(Block &block, Type new_type, Location loc) {
+  //   llvm::BitVector eraseIndices(block.getNumArguments(), true);
+  //   block.eraseArguments(eraseIndices);
+  //   // Add one new block argument type for the affine for induction variable
+  //   block.addArgument(new_type, loc);
+  // }
+
+  // static void propagateUses(AffineForOp for_loop, FuncOp func_op, Type block_argument_type) {
+  //   unsigned i = 0;
+  //   for (auto arg : for_loop.region().getArguments()) {
+  //     arg.replaceAllUsesWith(func_op.getArgument(i++));
+  //   }
+
+  //   reduceBlockArguments(for_loop.region().getBlocks().front(), block_argument_type, func_op.getLoc());
+  // }
+  
+
   
   b.setInsertionPointAfter(compute_loop);
 
   // 4. C_local drain to C_out
-  scf::IfOp C_drain_if = createIfWithConstantConditions(b, newCallee.getLoc(), {{loop0.getInductionVar(), 1}, {loop0.getInductionVar(), 7}});
+  scf::IfOp C_drain_if = createIfWithConstantConditions(b, loc, {{loop2.getInductionVar(), 1}, {loop3.getInductionVar(), 7}});
   // CallOp write_C_local_call_op = createWriteCallOp(b, C_local, newCallee.getArguments()[0], newCallee);
   // TODO why the above causes "error: operand #1 does not dominate this use"?
+
+  // TODO temporary solution
+  C_drain_if->setAttr("phism.write_C_drain", b.getUnitAttr());
 
   b.setInsertionPointAfter(C_drain_if);
 
   // 5. Drain B_local to B_out
-  CallOp write_B_local_call_op = createWriteCallOp(b, B_local, newCallee.getArguments()[4], newCallee);
-  // memref::AllocaOp u = b.create<memref::AllocaOp>(newCallee.getLoc(), newCallee.getArguments()[0].getType().cast<MemRefType>());
+  CallOp write_B_local_call_op = createWriteCallOp(b, B_local, newCallee.getArguments()[6], newCallee);
+  // memref::AllocaOp u = b.create<memref::AllocaOp>(loc, newCallee.getArguments()[0].getType().cast<MemRefType>());
   // u->setAttr("phism.type_name", StringAttr::get(context, "union {unsigned int ui; float ut;}"));
 
-  // arith::ConstantIndexOp ui = b.create<arith::ConstantIndexOp>(newCallee.getLoc(), 999);
-  // SmallVector<Value, 8> u_idxs = {ui, ui};
-  // memref::StoreOp u_store = b.create<memref::StoreOp>(newCallee.getLoc(), u, u, u_idxs);
+  // arith::ConstantIndexOp ui = b.create<arith::ConstantIndexOp>(loc, 999);
+  // SmallVector<Value, 2> u_idxs = {ui, ui};
+  // memref::StoreOp u_store = b.create<memref::StoreOp>(loc, u, u, u_idxs);
 
 
   write_B_local_call_op->setAttr("phism.include_reverse_union_hack", b.getUnitAttr());
 
   // 6. Drain A_local to A_out
-  CallOp write_A_local_call_op = createWriteCallOp(b, A_local, newCallee.getArguments()[3], newCallee);
+  // Block *new_block = newCallee.addBlock();
+  // new_block->addArgument(A_local.getType(), loc);
+  // new_block->addArgument(newCallee.getArguments()[3].getType(), loc);
+  // b.setInsertionPointToStart(new_block);
+  // TODO error: use of undeclared SSA value name?
+
+  CallOp write_A_local_call_op = createWriteCallOp(b, A_local, newCallee.getArguments()[5], newCallee);
   write_A_local_call_op->setAttr("phism.include_reverse_union_hack", b.getUnitAttr());
 
+  // b.create<ReturnOp>(loc);
+
   //////////////
+  printOperation(newCallee, "newCallee after steps 5. and 6.");
 
   // Copy all original attributes
   newCallee->setAttr("phism.pe", b.getUnitAttr());
@@ -521,17 +586,35 @@ static void handleCalleePE(FuncOp PE_func_op) {
 
   // Expicitly mark argument types
   std::vector<std::string> argument_types = {
-    "hls::stream<" + IO_type + ">",
+    makeHLSStream(IO_type),
     "unsigned",
     "unsigned",
-    "hls::stream<" + IO_type + ">",
-    "hls::stream<" + IO_type + ">",
+    makeHLSStream(IO_type),
+    makeHLSStream(IO_type),
+    makeHLSStream(IO_type),
+    makeHLSStream(IO_type),
     "unsigned"
   };
   newCallee->setAttr(
     "phism.argument_types",
-    StringAttr::get(context, convertArgumentTypes(argument_types))
+    StringAttr::get(context, vec2str(argument_types))
   );
+
+  std::vector<std::string> argument_names = {
+    "fifo_C_drain_out",
+    "unwanted_index0",
+    "unwanted_index1",
+    "fifo_A_in",
+    "fifo_B_in",
+    "fifo_A_out",
+    "fifo_B_out",
+    "wanted_index"
+  };
+  newCallee->setAttr(
+    "phism.argument_names",
+    StringAttr::get(context, vec2str(argument_names))
+  );
+
 
 }
 

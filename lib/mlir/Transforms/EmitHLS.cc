@@ -381,7 +381,8 @@ static std::string getTypeName(Value value) {
   // if (isa<IndexType>(valueType)) // seems to be newer LLVM version
   if (valueType.isa<IndexType>())
     // TODO change unsigned to ap_uint<?> where ? is big enough to fit for loop's upper bound
-    return "unsigned";
+    return "ap_uint<4>";
+    // return "unsigned";
   // if (auto intType = dyn_cast<IntegerType>(valueType)) { // seems to be newer LLVM version
   if (auto intType = valueType.dyn_cast<IntegerType>()) {
     if (intType.getWidth() == 1)
@@ -647,7 +648,7 @@ static std::string emitBlock(Block &block);
 
 static std::string emitOp(scf::ForOp forOp) {
   auto iter = forOp.getInductionVar();
-  auto iterName = getValueName(iter, "i");
+  auto iterName = getValueName(iter, "iter");
   // auto lowerBound = forOp.getLowerBound(); // used in newer LLVM
   auto lowerBound = forOp.lowerBound();
   // auto upperBound = forOp.getUpperBound(); // used in newer LLVM
@@ -667,7 +668,20 @@ static std::string emitOp(scf::IfOp ifOp) {
   auto cond = ifOp.condition();
   std::string ifBuff;
 
-  ifBuff = indent() + "if (" + getValueName(cond) + ") {\n" + emitBlock(ifOp.thenRegion().front());
+  ifBuff = indent() + "if (" + getValueName(cond) + ") {\n";
+  if (ifOp->hasAttr("phism.zero_local_C")) {
+    indent.add();
+    ifBuff += indent() + "local_C[c7][c6] = 0;\n";
+    indent.sub();
+  }
+  else if (ifOp->hasAttr("phism.write_C_drain")) {
+    indent.add();
+    ifBuff += indent() + "fifo_C_drain_out.write(local_C[c7][c6]);\n";
+    indent.sub();
+  }
+  else {
+    ifBuff += emitBlock(ifOp.thenRegion().front());
+  }
 
   if (!ifOp.elseRegion().empty()) {
     ifBuff += indent() + "} else {\n" + indent() + emitBlock(ifOp.elseRegion().front());
@@ -691,7 +705,7 @@ static std::string emitOp(scf::YieldOp yieldOp) {
 
 static std::string emitOp(AffineForOp affineForOp) {
   auto iter = affineForOp.getInductionVar();
-  auto iterName = getValueName(iter, "i");
+  auto iterName = getValueName(iter, "iter");
   auto step = affineForOp.getStep();
 
   std::string lowerBound;
@@ -734,13 +748,13 @@ static std::string emitOp(AffineForOp affineForOp) {
 
     affineForOpBuff += indent() + "union {unsigned int ui; float ut;} u;\n";
     affineForOpBuff += indent() + "u.ui = (unsigned int) " + localName + "(31, 0);\n";
-    affineForOpBuff += indent() + "local_A[0][n] = u.ut;\n"; // TODO this line doesnt make sense yet, because it uses local_A[0][n]
+    affineForOpBuff += indent() + "local_A[0][" + iterName + "] = u.ut;\n"; // TODO this line doesnt make sense yet, because it uses local_A[0][n]
     affineForOpBuff += indent() + localName + " = " + localName + " >> 32;\n";
 
-    // TODO should everything be handled by the hack or some things are still emitted?
-    // affineForOpBuff += emitBlock(*affineForOp.getBody());
-
     indent.sub();
+    
+    // TODO should everything be handled by the hack or some things are still emitted?
+    affineForOpBuff += emitBlock(*affineForOp.getBody());
   } else {
     affineForOpBuff += emitBlock(*affineForOp.getBody());
   }
@@ -1218,7 +1232,7 @@ static std::string declareValue(Value value) {
   // If it is a constant op, we initiliase it while declaring the variable.
   if (auto constantOp = dyn_cast<arith::ConstantOp>(value.getDefiningOp())) {
     if (isShapedType) {
-      variableName = getArrayInit(value, "ca");
+      variableName = getArrayInit(value, "const_array");
       declaration += variableName + " = {";
 
       auto denseAttr = constantOp.getValue().dyn_cast<DenseElementsAttr>();
@@ -1232,13 +1246,13 @@ static std::string declareValue(Value value) {
       declaration.pop_back();
       declaration += "}";
     } else {
-      variableName = getValueName(value, "c");
+      variableName = getValueName(value, "const");
       declaration += variableName + " = " + getConstantOperand(constantOp.getType(), constantOp.getValue());
     }
   }
 
   else {
-    variableName = (isShapedType ? getArrayInit(value, "a") : getValueName(value, "v"));
+    variableName = (isShapedType ? getArrayInit(value, "array") : getValueName(value, "var"));
     declaration += variableName;
   }
 
@@ -1250,7 +1264,7 @@ static std::string declareValue(Value value) {
 
 }
 
-static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
+static std::vector<std::string> getArgumentTypes(mlir::FuncOp funcOp) {
   std::vector<std::string> type_names = {};
   
   // No manually set argument types so find them with getTypeName(...)
@@ -1279,6 +1293,47 @@ static std::vector<std::string> getArgumentTypeNames(mlir::FuncOp funcOp) {
   return type_names;
 }
 
+static std::vector<std::string> getArgumentNames(mlir::FuncOp funcOp) {
+  std::vector<std::string> arg_names = {};
+
+  bool predefined_argument_names = funcOp->hasAttr("phism.argument_names");
+  std::string names_str;
+  if (predefined_argument_names) {
+    names_str = getStringFromAttribute(funcOp->getAttr("phism.argument_names"));
+
+    size_t pos = 0;
+    std::string token;
+
+    while ((pos = names_str.find(".")) != std::string::npos) {
+      token = names_str.substr(0, pos);
+      names_str.erase(0, pos + 1);
+      arg_names.push_back(token);
+    }
+
+    arg_names.push_back(names_str);
+
+    // TODO assert count of funcOp.getArguments() == arg_names length
+  }
+  
+  // No manually set argument types so find them with getTypeName(...)
+  unsigned i = 0;
+  for (auto arg : funcOp.getArguments()) {
+    if (!predefined_argument_names) {
+      arg_names.push_back(getValueName(arg, "arg"));
+    }
+    
+    // Manually set argument names so parse phism.argument_names attribute
+    else {
+      if (valueMap.count(arg) == 0) {
+        valueMap[arg] = arg_names[i++];
+        // LLVM_DEBUG(dbgs() << "arg: " << arg << ", arg_names[" << i << "]: " << arg_names[i] << ", so valueMap[arg]: " << valueMap[arg] << "\n");
+      }
+    }
+  }
+
+  return arg_names;
+}
+
 static std::string emitOp(mlir::FuncOp funcOp) {
   // Look for "no_emit" attribute
   if (funcOp->hasAttr("phism.no_emit")) {
@@ -1293,18 +1348,19 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   std::string funcOpBuff = indent() + "void " + funcOp.getName().str() + "(";
 
   // Emit input arguments.
-  std::vector<std::string> type_names = getArgumentTypeNames(funcOp);
+  std::vector<std::string> arg_types = getArgumentTypes(funcOp);
+  std::vector<std::string> arg_names = getArgumentNames(funcOp);
   std::string type_name;
-  std::string argName;
-  // SmallVector<Value, 8> args;
+  std::string arg_name;
   for (auto arg : llvm::enumerate(funcOp.getArguments())) {
     // if (!dyn_cast<ShapedType>(arg.getType())) // seems to be newer LLVM
     // if (!arg.getType().dyn_cast<ShapedType>())
     //   llvm_unreachable("Function arg has scalar type. This is not supported.");
     // auto argName = (dyn_cast<ShapedType>(arg.getType())) ? getArrayInit(arg) // seems to be newer LLVM
-    type_name = type_names[arg.index()];
-    argName = (arg.value().getType().dyn_cast<ShapedType>()) ? getArrayInit(arg.value(), "pa") : getValueName(arg.value(), "p");
-    funcOpBuff += type_name + " " + argName + ", ";
+    type_name = arg_types[arg.index()];
+    arg_name = arg_names[arg.index()];
+    // arg_name = (arg.value().getType().dyn_cast<ShapedType>()) ? getArrayInit(arg.value(), "arg_array") : getValueName(arg.value(), "arg");
+    funcOpBuff += type_name + " " + arg_name + ", ";
   }
   // Get rid of the last comma and space
   funcOpBuff.pop_back();
@@ -1318,7 +1374,7 @@ static std::string emitOp(mlir::FuncOp funcOp) {
 
   // Emit module index for PE
   if (funcOp->hasAttr("phism.pe"))
-    funcOpBuff += indent() + "unsigned p = " + argName + "; // module index\n";
+    funcOpBuff += indent() + "unsigned p = " + arg_name + "; // module index\n";
 
   // Collect all the local variables
   funcOpBuff += "\n" + indent() + "/* Local variable declaration */\n";
