@@ -5,25 +5,32 @@ vhls=/scratch/shared/Xilinx/
 th=1
 example=2mm
 
+# TODO
+# - local types are wrong (e.g. reading from hls_stream)
+# - output arguments are not passed by reference (missing "&")
+# - uint size for iters is not calcuated (defaults to ap_uint<4>)
+# - common functions should live in utils.h or similar to avoid duplication between Time and Space .cc files
+# - loading from pointer fails as I model poiter as [][] 3D array, so cannot simply memref.load with 1 index to mimic A[i] operation
+
 # Steps to start on Beholder server:
 # $ vagrant up && vagrant ssh
-# $ cd /vagrant
-# $ make shell
+# $ cd /vagrant && make shell
 
 # To run:
-# $ source scripts/source-all.sh && make test-systolic # (or any other test-*)
+# $ source scripts/source-all.sh && make test-systolic-SA # (or any other test-*)
 
 # To build:
 # $ source ~/.bashrc && ./scripts/build-phism.sh
 
-# Searching LLVM:
-# grep ./polygeist/llvm-project/mlir/lib/ ./polygeist/llvm-project/mlir/include/mlir/ -nRe "pattern"
+# Searching LLVM (including tablegen):
+# $ grep ./polygeist/llvm-project/mlir/lib/ ./polygeist/llvm-project/mlir/include/mlir/ ./polygeist/llvm-project/build/tools/mlir/ -inRe "pattern"
 
 .PHONY: build-docker shell install-pyphism test-example test-emit test-polybench test-polybench-polymer build-phism sync clean clean-phism
 
 # Build docker container
 build-docker: 
 	(cd Docker; docker build --build-arg UID=$(user) --build-arg GID=$(group) --build-arg VHLS_PATH=$(vhls) . --tag phism8)
+# (cd Docker; docker build --no-cache --build-arg UID=$(user) --build-arg GID=$(group) --build-arg VHLS_PATH=$(vhls) . --tag phism8)
 
 # Enter docker container
 shell: build-docker

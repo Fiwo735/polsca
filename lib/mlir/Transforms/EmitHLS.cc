@@ -148,9 +148,14 @@ static std::string getStringFromAttribute(Attribute attribute) {
   return attribute.dyn_cast<StringAttr>().getValue().str();
 }
 
-// TODO this should handle multiple pragmas, so list of strings and not just string
-static std::string pragmaGen(const std::string& pragma) {
-  return indent() + "#pragma HLS " + pragma + "\n";
+static std::string pragmaGen(const std::string& pragmas) {
+  std::stringstream ss(pragmas);
+  std::string final_pragmas = "";
+  for (std::string pragma; std::getline(ss, pragma, ',');) {
+    final_pragmas += indent() + "#pragma HLS " + pragma + "\n";
+  }
+
+  return final_pragmas;
 }
 
 static std::string pragmaGenIfAttrExists(Operation *op, const std::string& attr_name) {
@@ -362,9 +367,16 @@ static std::string getTypeName(Value value) {
   // if (value.dyn_cast<BlockArgument>())
   //   return unitTypeMap[value];
 
-  if (auto op = value.getDefiningOp())
-    if (op->hasAttr("phism.type_name"))
-      return getStringFromAttribute(op->getAttr("phism.type_name"));
+  if (auto op = value.getDefiningOp()) {
+    if (op->hasAttr("phism.type_name")) {
+      std::string type_name = getStringFromAttribute(op->getAttr("phism.type_name"));
+      
+      if (op->hasAttr("phism.hls_stream"))
+        return "hls::stream<" + type_name + ">";
+      else
+        return type_name;
+    }
+  }
 
   auto valueType = value.getType();
   // if (auto arrayType = dyn_cast<ShapedType>(valueType))
@@ -376,12 +388,13 @@ static std::string getTypeName(Value value) {
     return globalType;
   // if (isa<Float64Type>(valueType)) // seems to be newer LLVM version
   if (valueType.isa<Float64Type>())
-    return globalType;
+    return "ap_fixed<64,32>";
+    // return globalType;
 
   // if (isa<IndexType>(valueType)) // seems to be newer LLVM version
   if (valueType.isa<IndexType>())
     // TODO change unsigned to ap_uint<?> where ? is big enough to fit for loop's upper bound
-    return "ap_uint<4>";
+    return "ap_uint<8>";
     // return "unsigned";
   // if (auto intType = dyn_cast<IntegerType>(valueType)) { // seems to be newer LLVM version
   if (auto intType = valueType.dyn_cast<IntegerType>()) {
@@ -426,8 +439,7 @@ static std::string getArrayInit(Value array, const std::string &prefix = "v") {
   auto arrayType = array.getType().dyn_cast<ShapedType>();
 
   if (!arrayType.hasStaticShape())
-    llvm_unreachable(
-        "Function arg contains dynamic shape. This is not supported.");
+    llvm_unreachable("Function arg contains dynamic shape. This is not supported.");
 
   std::string arrayBuff;
   if (arrayType.hasStaticShape()) {
@@ -567,10 +579,19 @@ static std::string emitOp(memref::LoadOp loadOp) {
 }
 
 static std::string emitOp(memref::StoreOp storeOp) {
-  std::string storeBuff = indent() + getValueName(storeOp.getMemRef());
+  std::string lhs = getValueName(storeOp.getMemRef());
   for (auto index : storeOp.getIndices())
-    storeBuff += "[" + getValueName(index) + "]";
-  storeBuff += " = " + getValueName(storeOp.getValueToStore()) + ";\n";
+    lhs += "[" + getValueName(index) + "]";
+
+  std::string storeBuff = indent();
+
+  if (storeOp->hasAttr("phism.store_through_union")) {
+    storeBuff += "u.ui = (unsigned int) " + getValueName(storeOp.getValueToStore()) + "(31, 0);\n";
+    storeBuff += indent() + lhs + " = u.ut;\n";
+  }
+  else {
+    storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + ";\n";
+  }
   return storeBuff;
 }
 
@@ -668,20 +689,7 @@ static std::string emitOp(scf::IfOp ifOp) {
   auto cond = ifOp.condition();
   std::string ifBuff;
 
-  ifBuff = indent() + "if (" + getValueName(cond) + ") {\n";
-  if (ifOp->hasAttr("phism.zero_local_C")) {
-    indent.add();
-    ifBuff += indent() + "local_C[c7][c6] = 0;\n";
-    indent.sub();
-  }
-  else if (ifOp->hasAttr("phism.write_C_drain")) {
-    indent.add();
-    ifBuff += indent() + "fifo_C_drain_out.write(local_C[c7][c6]);\n";
-    indent.sub();
-  }
-  else {
-    ifBuff += emitBlock(ifOp.thenRegion().front());
-  }
+  ifBuff = indent() + "if (" + getValueName(cond) + ") {\n" + emitBlock(ifOp.thenRegion().front());
 
   if (!ifOp.elseRegion().empty()) {
     ifBuff += indent() + "} else {\n" + indent() + emitBlock(ifOp.elseRegion().front());
@@ -743,20 +751,19 @@ static std::string emitOp(AffineForOp affineForOp) {
   affineForOpBuff += pragmaGenIfAttrExists(affineForOp, "phism.hls_pragma");
   indent.sub();
 
-  if (affineForOp->hasAttr("phism.include_union_hack")) {
+  if (affineForOp->hasAttr("phism.include_union_decl")) {
     indent.add();
-
     affineForOpBuff += indent() + "union {unsigned int ui; float ut;} u;\n";
-    affineForOpBuff += indent() + "u.ui = (unsigned int) " + localName + "(31, 0);\n";
-    affineForOpBuff += indent() + "local_A[0][" + iterName + "] = u.ut;\n"; // TODO this line doesnt make sense yet, because it uses local_A[0][n]
-    affineForOpBuff += indent() + localName + " = " + localName + " >> 32;\n";
-
     indent.sub();
-    
-    // TODO should everything be handled by the hack or some things are still emitted?
-    affineForOpBuff += emitBlock(*affineForOp.getBody());
-  } else {
-    affineForOpBuff += emitBlock(*affineForOp.getBody());
+  }
+
+  affineForOpBuff += emitBlock(*affineForOp.getBody());
+
+  if (affineForOp->hasAttr("phism.include_ShRUIOp")) {
+    std::string shift_var = getStringFromAttribute(affineForOp->getAttr("phism.include_ShRUIOp"));
+    indent.add();
+    affineForOpBuff += indent() + shift_var + " = " + shift_var + " >> 32;\n";
+    indent.sub();
   }
 
   affineForOpBuff += indent() + "}\n";
@@ -1252,7 +1259,9 @@ static std::string declareValue(Value value) {
   }
 
   else {
-    variableName = (isShapedType ? getArrayInit(value, "array") : getValueName(value, "var"));
+    variableName = (isShapedType ? getArrayInit(value, "array")
+                                 : getValueName(value, ((value.getDefiningOp()->hasAttr("phism.is_condition")) ? "cond"
+                                                                                                               : "var")));
     declaration += variableName;
   }
 
@@ -1372,9 +1381,9 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   // Emit HLS pragmas
   funcOpBuff += pragmaGenIfAttrExists(funcOp, "phism.hls_pragma");
 
-  // Emit module index for PE
-  if (funcOp->hasAttr("phism.pe"))
-    funcOpBuff += indent() + "unsigned p = " + arg_name + "; // module index\n";
+  // Emit module index
+  if (funcOp->hasAttr("phism.create_index"))
+    funcOpBuff += indent() + "unsigned p0 = " + arg_names.end()[-2] + ", p1 = " + arg_names.end()[-1] + "; // module index\n";
 
   // Collect all the local variables
   funcOpBuff += "\n" + indent() + "/* Local variable declaration */\n";

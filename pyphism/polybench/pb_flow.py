@@ -1027,6 +1027,7 @@ class PbFlow(PhismRunner):
             self.get_program_abspath("phism-opt"),
             src_file,
             f'-systolic-array-time-loop',
+            # "-canonicalize",
             "-debug-only=systolic-array-time-loop",
         ]
 
