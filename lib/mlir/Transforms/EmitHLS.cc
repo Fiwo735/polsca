@@ -148,6 +148,10 @@ static std::string getStringFromAttribute(Attribute attribute) {
   return attribute.dyn_cast<StringAttr>().getValue().str();
 }
 
+static int64_t getIntegerFromAttribute(Attribute attribute, unsigned width = 32) {
+  return attribute.dyn_cast<IntegerAttr>().getInt();
+}
+
 static std::string pragmaGen(const std::string& pragmas) {
   std::stringstream ss(pragmas);
   std::string final_pragmas = "";
@@ -589,6 +593,9 @@ static std::string emitOp(memref::StoreOp storeOp) {
     storeBuff += "u.ui = (unsigned int) " + getValueName(storeOp.getValueToStore()) + "(31, 0);\n";
     storeBuff += indent() + lhs + " = u.ut;\n";
   }
+  else if (storeOp->hasAttr("phism.store_through_bit_access")) {
+    storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + "(63, 0);\n";
+  }
   else {
     storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + ";\n";
   }
@@ -760,9 +767,11 @@ static std::string emitOp(AffineForOp affineForOp) {
   affineForOpBuff += emitBlock(*affineForOp.getBody());
 
   if (affineForOp->hasAttr("phism.include_ShRUIOp")) {
-    std::string shift_var = getStringFromAttribute(affineForOp->getAttr("phism.include_ShRUIOp"));
+    std::string var_and_amount = getStringFromAttribute(affineForOp->getAttr("phism.include_ShRUIOp"));
+    std::string shift_var = var_and_amount.substr(0, var_and_amount.find(","));
+    std::string shift_amount = var_and_amount.substr(var_and_amount.find(",") + 1, var_and_amount.size());
     indent.add();
-    affineForOpBuff += indent() + shift_var + " = " + shift_var + " >> 32;\n";
+    affineForOpBuff += indent() + shift_var + " = " + shift_var + " >> " + shift_amount + ";\n";
     indent.sub();
   }
 
@@ -1253,8 +1262,11 @@ static std::string declareValue(Value value) {
       declaration.pop_back();
       declaration += "}";
     } else {
-      variableName = getValueName(value, "const");
-      declaration += variableName + " = " + getConstantOperand(constantOp.getType(), constantOp.getValue());
+      std::string constantOperand = getConstantOperand(constantOp.getType(), constantOp.getValue());
+      variableName = ((constantOperand == "0")   ? getValueName(value, "zero") : 
+                     (((constantOperand == "1")) ? getValueName(value, "one")  : 
+                                                   getValueName(value, "const")));
+      declaration += variableName + " = " + constantOperand;
     }
   }
 
@@ -1382,8 +1394,20 @@ static std::string emitOp(mlir::FuncOp funcOp) {
   funcOpBuff += pragmaGenIfAttrExists(funcOp, "phism.hls_pragma");
 
   // Emit module index
-  if (funcOp->hasAttr("phism.create_index"))
-    funcOpBuff += indent() + "unsigned p0 = " + arg_names.end()[-2] + ", p1 = " + arg_names.end()[-1] + "; // module index\n";
+  if (funcOp->hasAttr("phism.create_index")){
+    auto indices_count = getIntegerFromAttribute(funcOp->getAttr("phism.create_index"), /*width*/ 32);
+
+    // p0 = [-3] ... p1 = [-2] ... p2 = [-1]
+    funcOpBuff += indent();
+    int64_t p_index = 0;
+    while (indices_count > 0) {
+      std::string ending = (indices_count > 1) ? ", " : "; // module index\n";
+      funcOpBuff += "unsigned p" + std::to_string(p_index++) + " = " + arg_names.end()[-(indices_count--)] + ending;
+    }
+
+    // funcOpBuff += indent() + "unsigned p0 = " + arg_names.end()[-2] + ", p1 = " + arg_names.end()[-1] + "; // module index\n";
+
+  }
 
   // Collect all the local variables
   funcOpBuff += "\n" + indent() + "/* Local variable declaration */\n";

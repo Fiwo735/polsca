@@ -290,7 +290,7 @@ static memref::AllocaOp initializeInputVariable(ConversionPatternRewriter &b, ML
                                                             SmallVector<Value, 2>({i_zero, inner_loop.getInductionVar()}));
   fifo_to_local->setAttr("phism.store_through_union", b.getUnitAttr());// TODO this could be added to constructor create
   
-  inner_loop->setAttr("phism.include_ShRUIOp", StringAttr::get(context, result_name));
+  inner_loop->setAttr("phism.include_ShRUIOp", StringAttr::get(context, result_name + "," + "32"));
   // shift really does require the same types and we need to make them same to use it + shift only accepts int
   // arith::ConstantOp f_thirty_two = b.create<arith::ConstantOp>(callee.getLoc(), FloatAttr::get(b.getF64Type(), 32.0));
   // arith::ShRUIOp shift_right_op = b.create<arith::ShRUIOp>(callee.getLoc(), hls_stream_read.getResults()[0], f_thirty_two);
@@ -345,7 +345,7 @@ static CallOp createWriteCallOp(ConversionPatternRewriter &b, Value from, Value 
   return hls_stream_write;
 }
 
-static scf::IfOp createIfWithConstantConditions(ConversionPatternRewriter &b, Location loc, const std::vector<std::pair<Value, int>>& cond_pairs) {
+static scf::IfOp createIfWithConstantConditions(ConversionPatternRewriter &b, Location loc, const std::vector<std::pair<Value, int>>& cond_pairs, bool has_else = false) {
   // Structure: if (... & value == equal_to & ...)
   Value condition = nullptr;
   for (const auto& [value, equal_to] : cond_pairs) {
@@ -356,7 +356,7 @@ static scf::IfOp createIfWithConstantConditions(ConversionPatternRewriter &b, Lo
     condition.getDefiningOp()->setAttr("phism.is_condition", b.getUnitAttr());
   }
 
-  scf::IfOp compute_if = b.create<scf::IfOp>(loc, condition, /*hasElse*/ false);
+  scf::IfOp compute_if = b.create<scf::IfOp>(loc, condition, /*hasElse*/ has_else);
 
   b.setInsertionPointToStart(&(compute_if.thenRegion().front()));
   return compute_if;
@@ -398,7 +398,7 @@ static void handleCalleePE(FuncOp PE_func_op) {
     newFuncType
   );
 
-  newCallee->setAttr("phism.create_index", b.getUnitAttr());
+  newCallee->setAttr("phism.create_index", IntegerAttr::get(b.getIntegerType(32), 2));
 
   Location loc = newCallee.getLoc();
 
