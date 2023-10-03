@@ -594,7 +594,29 @@ static std::string emitOp(memref::StoreOp storeOp) {
     storeBuff += indent() + lhs + " = u.ut;\n";
   }
   else if (storeOp->hasAttr("phism.store_through_bit_access")) {
-    storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + "(63, 0);\n";
+    std::string shift_amount = getStringFromAttribute(storeOp->getAttr("phism.store_through_bit_access"));
+    storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + "(" + std::to_string(std::stoul(shift_amount) - 1) + ", 0);\n";
+  }
+  else if (storeOp->hasAttr("phism.load_through_ap_uint")) {
+    std::string bit_amount = getStringFromAttribute(storeOp->getAttr("phism.load_through_ap_uint"));
+    storeBuff += "union {unsigned int ui; float ut;} u;\n";
+    storeBuff += indent() + "u.ut = " + getValueName(storeOp.getValueToStore()) + ";\n";
+    storeBuff += indent() + lhs + " = ap_uint<" + bit_amount + ">(u.ui);\n";
+  }
+  else if (storeOp->hasAttr("phism.assemble_with")) {
+    std::string var_and_amount = getStringFromAttribute(storeOp->getAttr("phism.assemble_with"));
+    std::string var = var_and_amount.substr(0, var_and_amount.find(","));
+    std::string amount = var_and_amount.substr(var_and_amount.find(",") + 1, var_and_amount.size());
+
+    storeBuff += getValueName(storeOp.getValueToStore()) + " = (";
+    for (int index = std::stoi(amount) - 1; index >= 0; index--) {
+      storeBuff += var + "[" + std::to_string(index) + "], ";
+    }
+    storeBuff.pop_back(); // remove trailing comma
+    storeBuff.pop_back(); // remove trailing space
+    storeBuff += ");\n";
+
+    storeBuff += indent() + lhs + " = " + getValueName(storeOp.getValueToStore()) + ";\n";
   }
   else {
     storeBuff += lhs + " = " + getValueName(storeOp.getValueToStore()) + ";\n";

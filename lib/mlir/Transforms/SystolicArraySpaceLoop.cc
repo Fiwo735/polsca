@@ -225,7 +225,7 @@ static FuncOp create_IO_L3_in_serialize(FuncOp current_func_op, mlir::MemRefType
 
   // Load from input pointer to temporary
   b.setInsertionPointToStart(loop.getBody());
-  memref::LoadOp load_op = b.create<memref::LoadOp>(loc, func_op.getArguments()[0], SmallVector<Value, 2>({loop.getInductionVar(), loop.getInductionVar()}));
+  memref::LoadOp load_op = b.create<memref::LoadOp>(loc, func_op.getArguments()[0], SmallVector<Value, 2>({loop.getInductionVar(), loop.getInductionVar()})); // TODO double index to hack memref as ptr
 
   // Use a custom call op for writing to hls stream
   CallOp write_C_local_call_op = createWriteCallOp(b, load_op, func_op.getArguments()[1], func_op);
@@ -515,7 +515,7 @@ static FuncOp create_IO_L2_in_intra_trans(FuncOp current_func_op, mlir::MemRefTy
 
   // Use emit hacks to avoid having to deal with bit accessing and MLIR shift type consistency issues
   memref::StoreOp data_split_store = b.create<memref::StoreOp>(loc, in_data, data_split, SmallVector<Value, 1>({inner_loop.getInductionVar()}));
-  data_split_store->setAttr("phism.store_through_bit_access", b.getUnitAttr());
+  data_split_store->setAttr("phism.store_through_bit_access", StringAttr::get(context, "64"));
   inner_loop->setAttr("phism.include_ShRUIOp", StringAttr::get(context, "in_data,64"));
 
   b.setInsertionPointAfter(inner_loop);
@@ -864,6 +864,547 @@ static FuncOp createDummyPEIn(FuncOp current_func_op, Value in_value, const std:
   return func_op;
 }
 
+static FuncOp create_drain_IO_L1_out_inter_trans(FuncOp current_func_op, mlir::MemRefType out_type, const std::string& out_type_name,
+                                          const std::string& name, bool is_boundary, ConversionPatternRewriter &b) {
+  // When boundary IO then there's one less argument, so offest for that when accessing. Reverse accessing (i.e. [-1]) is illegal for func arguments
+  unsigned arg_offset = is_boundary ? 1 : 0;
+  
+  MLIRContext *context = current_func_op.getContext();
+
+  auto index_type = IndexType::get(context);
+  auto bool_type = b.getIntegerType(1);
+  auto local_type = MemRefType::get({8, 2}, out_type.getElementType());
+
+  SmallVector<Type> arg_types = {index_type, index_type, local_type};
+  if (!is_boundary) arg_types.push_back(out_type);
+  SmallVector<Type> remaining_arg_types = {out_type, index_type, index_type};
+  arg_types.insert(arg_types.end(), remaining_arg_types.begin(), remaining_arg_types.end());
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.create_index", IntegerAttr::get(b.getIntegerType(32), 2));
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, "INLINE"));
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 1:\n"; func_op.dump();});
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  b.setInsertionPointToStart(block);
+
+  // Add additional loop
+  AffineForOp loop = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop.getBody());
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 2:\n"; func_op.dump();});
+
+  // Add if iter == idx condition
+  scf::IfOp iter_if = createIfWithConditions(b, loc, {{loop.getInductionVar(), func_op.getArguments()[5 - arg_offset]}}, /*has_else*/ !is_boundary);
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 3:\n"; func_op.dump();});
+
+  // Add then loops
+  AffineForOp then_loop0 = b.create<AffineForOp>(loc, 0, 8, 1);
+  b.setInsertionPointToStart(then_loop0.getBody());
+  AffineForOp then_loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+  then_loop1->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+  b.setInsertionPointToStart(then_loop1.getBody());
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 4:\n"; func_op.dump();});
+
+  // Read from local
+  memref::LoadOp in_data = b.create<memref::LoadOp>(loc, func_op.getArguments()[2], SmallVector<Value, 2>({then_loop0.getInductionVar(), then_loop1.getInductionVar()}));
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 5:\n"; func_op.dump();});
+
+  // Use a custom call op for writing to hls stream
+  CallOp out_write_call_op = createWriteCallOp(b, in_data, func_op.getArguments()[4 - arg_offset], func_op);
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 6:\n"; func_op.dump();});
+
+  if (!is_boundary) {
+    // Add else loops
+    b.setInsertionPointToStart(&(iter_if.elseRegion().front()));
+    AffineForOp else_loop0 = b.create<AffineForOp>(loc, 0, 8, 1);
+    b.setInsertionPointToStart(else_loop0.getBody());
+    AffineForOp else_loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+    else_loop1->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+    b.setInsertionPointToStart(else_loop1.getBody());
+
+    LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 7:\n"; func_op.dump();});
+
+    // Use a custom call op for reading from hls stream
+    CallOp else_read_call_op = createReadCallOp(b, func_op.getArguments()[3], func_op);
+
+    LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 8:\n"; func_op.dump();});
+
+    // Use a custom call op for writing to hls stream
+    CallOp else_write_call_op = createWriteCallOp(b, else_read_call_op.getResults()[0], func_op.getArguments()[4], func_op);
+
+    LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 9:\n"; func_op.dump();});
+  }
+
+  // Set insertion to after all for loops and add func return
+  b.setInsertionPointAfter(loop);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after 10:\n"; func_op.dump();});
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {
+    "ap_uint<2>", //TODO ensure this matches the caller's index width
+    "ap_uint<2>", //TODO ensure this matches the caller's index width
+    out_type_name
+  };
+  if (!is_boundary) argument_types.push_back(makeHLSStream(out_type_name));
+  std::vector<std::string> remaining_argument_types = {makeHLSStream(out_type_name), "unsigned", "unsigned"};
+  argument_types.insert(argument_types.end(), remaining_argument_types.begin(), remaining_argument_types.end());
+
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_inter_trans func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
+static FuncOp create_drain_IO_L1_out_intra_trans(FuncOp current_func_op, mlir::MemRefType out_type, const std::string& out_type_name,
+                                          const std::string& name, ConversionPatternRewriter &b) {
+  MLIRContext *context = current_func_op.getContext();
+
+  auto index_type = IndexType::get(context);
+  auto local_type = MemRefType::get({8, 2}, out_type.getElementType());
+
+  SmallVector<Type> arg_types = {index_type, index_type, local_type, out_type, index_type, index_type};
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.create_index", IntegerAttr::get(b.getIntegerType(32), 2));
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, "INLINE"));
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  b.setInsertionPointToStart(block);
+
+  // Allocate data_split
+  auto data_split_type = MemRefType::get({4}, out_type.getElementType());
+  memref::AllocaOp data_split = b.create<memref::AllocaOp>(loc, data_split_type);
+  data_split->setAttr("phism.variable_name", StringAttr::get(context, "data_split"));
+  data_split->setAttr("phism.hls_pragma", StringAttr::get(context, "ARRAY_PARTITION variable=$ complete"));
+
+  // Add additional loops
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 8, 1);
+
+  b.setInsertionPointToStart(loop0.getBody());
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 8, 1);
+  loop1->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+
+  b.setInsertionPointToStart(loop1.getBody());
+
+  // Use a custom call op for reading from hls stream
+  CallOp then_read_call_op = createReadCallOp(b, func_op.getArguments()[3], func_op);
+
+  // Load from local
+  arith::ConstantIndexOp four = b.create<arith::ConstantIndexOp>(loc, 4);
+  arith::DivUIOp outer_index = b.create<arith::DivUIOp>(loc, loop0.getInductionVar(), four);
+  arith::RemUIOp split_idx = b.create<arith::RemUIOp>(loc, loop0.getInductionVar(), four);
+  memref::LoadOp out_data = b.create<memref::LoadOp>(loc, func_op.getArguments()[2], SmallVector<Value, 2>({loop1.getInductionVar(), outer_index}));
+  out_data->setAttr("phism.variable_name", StringAttr::get(context, "out_data"));
+
+  // Add inner loop
+  AffineForOp inner_loop = b.create<AffineForOp>(loc, 0, 4, 1);
+  inner_loop->setAttr("phism.hls_pragma", StringAttr::get(context, "UNROLL"));
+  b.setInsertionPointToStart(inner_loop.getBody());
+
+  // Use emit hacks to avoid having to deal with bit accessing and MLIR shift type consistency issues
+  memref::StoreOp data_split_store = b.create<memref::StoreOp>(loc, out_data, data_split, SmallVector<Value, 1>({inner_loop.getInductionVar()}));
+  data_split_store->setAttr("phism.store_through_bit_access", StringAttr::get(context, "32"));
+  inner_loop->setAttr("phism.include_ShRUIOp", StringAttr::get(context, "out_data,32"));
+
+  b.setInsertionPointAfter(inner_loop);
+
+  // Write to data_split
+  memref::StoreOp outer_data_split_store = b.create<memref::StoreOp>(loc, then_read_call_op.getResults()[0], data_split, SmallVector<Value, 1>({split_idx}));
+  outer_data_split_store->setAttr("phism.load_through_ap_uint", StringAttr::get(context, "32"));
+
+  // Write to local
+  memref::StoreOp local_store = b.create<memref::StoreOp>(loc, out_data, func_op.getArguments()[2], SmallVector<Value, 2>({loop1.getInductionVar(), outer_index}));
+  local_store->setAttr("phism.assemble_with", StringAttr::get(context, "data_split,4"));
+
+  // Set insertion to after all for loops and add func return
+  b.setInsertionPointAfter(loop0);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {
+    "ap_uint<2>", //TODO ensure this matches the caller's index width
+    "ap_uint<2>", //TODO ensure this matches the caller's index width
+    out_type_name,
+    makeHLSStream(out_type_name),
+    "unsigned",
+    "unsigned"
+  };
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out_intra_trans func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
+static FuncOp create_drain_IO_L1_out(FuncOp current_func_op, FuncOp drain_IO_L1_out_inter_trans, FuncOp drain_IO_L1_out_inter_trans_boundary, FuncOp drain_IO_L1_out_intra_trans,
+                                     mlir::MemRefType out_type, const std::string& out_type_name, const std::string& name, bool is_boundary, ConversionPatternRewriter &b) {
+  // When boundary IO then there's one less argument, so offest for that when accessing. Reverse accessing (i.e. [-1]) is illegal for func arguments
+  unsigned arg_offset = is_boundary ? 1 : 0;
+  
+  MLIRContext *context = current_func_op.getContext();
+
+  SmallVector<Type> arg_types = {};
+  if (!is_boundary) arg_types.push_back(out_type);
+  SmallVector<Type> remaining_arg_types = {out_type, out_type, IndexType::get(context), IndexType::get(context)};
+  arg_types.insert(arg_types.end(), remaining_arg_types.begin(), remaining_arg_types.end());
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.create_index", IntegerAttr::get(b.getIntegerType(32), 2));
+  std::string inline_pragma = (is_boundary) ? "INLINE" : "INLINE OFF";
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, inline_pragma));
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  b.setInsertionPointToStart(block);
+
+  // Allocate local buffer
+  auto local_type = MemRefType::get({8, 2}, out_type.getElementType());
+  memref::AllocaOp local = b.create<memref::AllocaOp>(loc, local_type);
+
+  // Add additional loops
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop0.getBody());
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop1.getBody());
+
+// Intra call
+  SmallVector<Value, 7> drain_IO_L1_out_intra_trans_operands = {
+    loop0.getInductionVar(),
+    loop1.getInductionVar(),
+    local,
+    func_op.getArguments()[2 - arg_offset],
+    func_op.getArguments()[3 - arg_offset],
+    func_op.getArguments()[4 - arg_offset]
+  };
+  CallOp intra_call = b.create<CallOp>(
+    drain_IO_L1_out_intra_trans.getLoc(),
+    drain_IO_L1_out_intra_trans,
+    drain_IO_L1_out_intra_trans_operands
+  );
+
+  // Inter call
+  if (is_boundary) {
+    SmallVector<Value, 6> drain_IO_L1_out_inter_trans_boundary_operands= {
+      loop0.getInductionVar(),
+      loop1.getInductionVar(),
+      local,
+      func_op.getArguments()[1 - arg_offset],
+      func_op.getArguments()[3 - arg_offset],
+      func_op.getArguments()[4 - arg_offset]
+    };
+    CallOp inter_call = b.create<CallOp>(
+      drain_IO_L1_out_inter_trans_boundary.getLoc(),
+      drain_IO_L1_out_inter_trans_boundary,
+      drain_IO_L1_out_inter_trans_boundary_operands
+    );
+  }
+  else {
+    SmallVector<Value, 7> drain_IO_L1_out_inter_trans_operands = {
+      loop0.getInductionVar(),
+      loop1.getInductionVar(),
+      local,
+      func_op.getArguments()[0],
+      func_op.getArguments()[1 - arg_offset],
+      func_op.getArguments()[3 - arg_offset],
+      func_op.getArguments()[4 - arg_offset]
+    };
+    CallOp inter_call = b.create<CallOp>(
+      drain_IO_L1_out_inter_trans.getLoc(),
+      drain_IO_L1_out_inter_trans,
+      drain_IO_L1_out_inter_trans_operands
+    );
+  }
+
+  // Add func return
+  b.setInsertionPointAfter(loop0);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {
+  };
+  if (!is_boundary) argument_types.push_back(makeHLSStream(out_type_name));
+  std::vector<std::string> remaining_argument_types = {makeHLSStream(out_type_name), makeHLSStream(out_type_name), "unsigned", "unsigned"};
+  argument_types.insert(argument_types.end(), remaining_argument_types.begin(), remaining_argument_types.end());
+
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L1_out func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
+static FuncOp create_drain_IO_L2_out(FuncOp current_func_op, mlir::MemRefType out_type, const std::string& out_type_name, const std::string& name, bool is_boundary, ConversionPatternRewriter &b) {
+  // When boundary IO then there's one less argument, so offest for that when accessing. Reverse accessing (i.e. [-1]) is illegal for func arguments
+  unsigned arg_offset = is_boundary ? 1 : 0;
+
+  MLIRContext *context = current_func_op.getContext();
+
+  SmallVector<Type> arg_types = {};
+  if (!is_boundary) arg_types.push_back(out_type);
+  SmallVector<Type> remaining_arg_types = {out_type, out_type, IndexType::get(context)};
+  arg_types.insert(arg_types.end(), remaining_arg_types.begin(), remaining_arg_types.end());
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, "INLINE OFF"));
+  func_op->setAttr("phism.create_index", IntegerAttr::get(b.getIntegerType(32), 1));
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  // Add additional loops
+  b.setInsertionPointToStart(block);
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop0.getBody());
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop1.getBody());
+  AffineForOp loop2 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop2.getBody());
+
+  // Add if iter == idx
+  scf::IfOp iter_if = createIfWithConditions(b, loc, {{loop2.getInductionVar(), func_op.getArguments()[3 - arg_offset]}}, /*has_else*/ !is_boundary);
+
+  // Add more additional loops
+  AffineForOp loop3 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop3.getBody());
+  AffineForOp loop4 = b.create<AffineForOp>(loc, 0, 8, 1);
+  b.setInsertionPointToStart(loop4.getBody());
+  AffineForOp loop5 = b.create<AffineForOp>(loc, 0, 2, 1);
+  loop5->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+  b.setInsertionPointToStart(loop5.getBody());
+
+  // Use a custom call op for reading from hls stream
+  CallOp read_call_op = createReadCallOp(b, func_op.getArguments()[2 - arg_offset], func_op);
+
+  // Use a custom call op for writing to hls stream
+  CallOp write_call_op = createWriteCallOp(b, read_call_op.getResults()[0], func_op.getArguments()[1 - arg_offset], func_op);
+
+  if (!is_boundary) {
+    // Handle else branch
+    b.setInsertionPointToStart(&(iter_if.elseRegion().front()));
+
+    // Add more additional loops
+    AffineForOp else_loop3 = b.create<AffineForOp>(loc, 0, 2, 1);
+    b.setInsertionPointToStart(else_loop3.getBody());
+    AffineForOp else_loop4 = b.create<AffineForOp>(loc, 0, 8, 1);
+    b.setInsertionPointToStart(else_loop4.getBody());
+    AffineForOp else_loop5 = b.create<AffineForOp>(loc, 0, 2, 1);
+    else_loop5->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+    b.setInsertionPointToStart(else_loop5.getBody());
+
+    // Use a custom call op for reading from hls stream
+    CallOp read_call_op = createReadCallOp(b, func_op.getArguments()[0], func_op);
+
+    // Use a custom call op for writing to hls stream
+    CallOp write_call_op = createWriteCallOp(b, read_call_op.getResults()[0], func_op.getArguments()[1], func_op);
+  }
+  
+  // Set insertion to after all for loops and add func return
+  b.setInsertionPointAfter(loop0);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {
+  };
+  if (!is_boundary) argument_types.push_back(makeHLSStream(out_type_name));
+  std::vector<std::string> remaining_argument_types = {makeHLSStream(out_type_name), makeHLSStream(out_type_name), "unsigned"};
+  argument_types.insert(argument_types.end(), remaining_argument_types.begin(), remaining_argument_types.end());
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L2_out func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
+static FuncOp create_drain_IO_L3_out(FuncOp current_func_op, mlir::MemRefType out_type, const std::string& out_type_name, const std::string& name, ConversionPatternRewriter &b) {
+  MLIRContext *context = current_func_op.getContext();
+
+  SmallVector<Type> arg_types = {out_type, out_type};
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, "INLINE OFF"));
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  // Add additional loops
+  b.setInsertionPointToStart(block);
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop0.getBody());
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop1.getBody());
+  AffineForOp loop2 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop2.getBody());
+  AffineForOp loop3 = b.create<AffineForOp>(loc, 0, 2, 1);
+  b.setInsertionPointToStart(loop3.getBody());
+  AffineForOp loop4 = b.create<AffineForOp>(loc, 0, 8, 1);
+  b.setInsertionPointToStart(loop4.getBody());
+  AffineForOp loop5 = b.create<AffineForOp>(loc, 0, 2, 1);
+  loop5->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+  b.setInsertionPointToStart(loop5.getBody());
+
+  // Use a custom call op for reading from hls stream
+  CallOp read_call_op = createReadCallOp(b, func_op.getArguments()[1], func_op);
+
+  // Use a custom call op for writing to hls stream
+  CallOp write_call_op = createWriteCallOp(b, read_call_op.getResults()[0], func_op.getArguments()[0], func_op);
+  
+  // Set insertion to after all for loops and add func return
+  b.setInsertionPointAfter(loop0);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {makeHLSStream(out_type_name), makeHLSStream(out_type_name)};
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L3_out func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
+static FuncOp create_drain_IO_L3_out_serialize(FuncOp current_func_op, mlir::MemRefType out_type, const std::string& out_type_name, const std::string& name, ConversionPatternRewriter &b) {
+  MLIRContext *context = current_func_op.getContext();
+
+  SmallVector<Type> arg_types = {out_type, out_type};
+  SmallVector<Type> res_types = {};
+
+  auto insertion_point = b.saveInsertionPoint();
+  b.setInsertionPoint(current_func_op);
+
+  FuncOp func_op = b.create<FuncOp>(
+    current_func_op.getLoc(),
+    name,
+    b.getFunctionType(arg_types, res_types)
+  );
+  func_op->setAttr("phism.hls_pragma", StringAttr::get(context, "INLINE OFF"));
+
+  Location loc = func_op.getLoc();
+  Block *block = func_op.addEntryBlock();
+
+  // Add additional loop
+  b.setInsertionPointToStart(block);
+  AffineForOp loop0 = b.create<AffineForOp>(loc, 0, 64, 1);
+  loop0->setAttr("phism.hls_pragma", StringAttr::get(context, "PIPELINE II=1"));
+  b.setInsertionPointToStart(loop0.getBody());
+
+  // Allocate mem_data
+  auto mem_data_type = MemRefType::get({1}, out_type.getElementType());
+  memref::AllocaOp mem_data = b.create<memref::AllocaOp>(loc, mem_data_type);
+  mem_data->setAttr("phism.variable_name", StringAttr::get(context, "mem_data"));
+
+  // Allocate mem_data_split
+  auto mem_data_split_type = MemRefType::get({4}, out_type.getElementType());
+  memref::AllocaOp mem_data_split = b.create<memref::AllocaOp>(loc, mem_data_split_type);
+  mem_data_split->setAttr("phism.variable_name", StringAttr::get(context, "mem_data_split"));
+  mem_data_split->setAttr("phism.hls_pragma", StringAttr::get(context, "ARRAY_PARTITION variable=$ complete"));
+  
+  // Add additional loop
+  AffineForOp loop1 = b.create<AffineForOp>(loc, 0, 4, 1);
+  b.setInsertionPointToStart(loop1.getBody());
+
+  // Use a custom call op for reading from hls stream
+  CallOp read_call_op = createReadCallOp(b, func_op.getArguments()[1], func_op);
+
+  // Store to mem_data_split
+  memref::StoreOp mem_data_split_store = b.create<memref::StoreOp>(loc, read_call_op.getResults()[0], mem_data_split, SmallVector<Value, 1>({loop1.getInductionVar()}));
+
+  // Store to output
+  b.setInsertionPointAfter(loop1);
+  arith::ConstantIndexOp index_zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  memref::LoadOp mem_data_load = b.create<memref::LoadOp>(loc, mem_data, SmallVector<Value, 1>({index_zero}));
+  memref::StoreOp output_store = b.create<memref::StoreOp>(loc, mem_data_load, func_op.getArguments()[0], SmallVector<Value, 2>({loop0.getInductionVar(), loop0.getInductionVar()})); // TODO double index to hack memref as ptr
+  output_store->setAttr("phism.assemble_with", StringAttr::get(context, "mem_data_split,4"));
+
+  // Set insertion to after all for loops and add func return
+  b.setInsertionPointAfter(loop0);
+  b.create<ReturnOp>(func_op.getLoc());
+
+  // Expicitly mark argument types
+  std::vector<std::string> argument_types = {makePointer(out_type_name), makeHLSStream(out_type_name)};
+  func_op->setAttr(
+    "phism.argument_types",
+    StringAttr::get(context, vec2str(argument_types))
+  );
+
+  LLVM_DEBUG({dbgs() << "create_drain_IO_L3_out_serialize func op after adding block with return op:\n"; func_op.dump();});
+
+  b.restoreInsertionPoint(insertion_point);
+  return func_op;
+}
+
 static inline std::string makeIndexName(const std::string &name, const SmallVector<unsigned> &coords) {
   std::string index_name = name;
 
@@ -1094,6 +1635,9 @@ static void handleTopFuncOp(FuncOp top_func_op, FuncOp PE_func_op) {
 
   // ---------------------------------------------------------------------------------------------------------
 
+  // 2D vector: [idx][idy]
+  SmallVector<SmallVector<memref::AllocaOp, 2>, 2> fifo_C_drains(2, SmallVector<memref::AllocaOp, 2>(2));
+
   // Instantiate PEs and connect them using existing I/O
   for (unsigned x = 0; x < PE_dims; x++) {
     for (unsigned y = 0; y < PE_dims; y++) {
@@ -1105,6 +1649,8 @@ static void handleTopFuncOp(FuncOp top_func_op, FuncOp PE_func_op) {
       fifo_C_drain->setAttr("phism.hls_stream", b.getUnitAttr());
       fifo_C_drain->setAttr("phism.type_name", StringAttr::get(context, IO_type));
       fifo_C_drain->setAttr("phism.hls_pragma", StringAttr::get(context, "STREAM variable=$ depth=2,RESOURCE variable=$ core=FIFO_SRL"));
+
+      fifo_C_drains[x][y] = fifo_C_drain;
 
       operands.push_back(fifo_C_drain);
       operands.push_back(PE_IOs[0][x][y]);
@@ -1167,12 +1713,142 @@ static void handleTopFuncOp(FuncOp top_func_op, FuncOp PE_func_op) {
     );
   }
 
+  // ---------------------------------------------------------------------------------------------------------
+
+  // Allocate drain IO for L1
+  // 2D vector: [idx][idy]
+  SmallVector<SmallVector<memref::AllocaOp, 2>, 2> fifo_C_drain_C_drain_IO_L1_outs(2, SmallVector<memref::AllocaOp, 2>(2));
+
+  for (unsigned x = 0; x < PE_dims; x++) {
+    for (unsigned y = 0; y < PE_dims; y++) {
+      memref::AllocaOp fifo_C_drain_IO_L1_out = b.create<memref::AllocaOp>(loc, C_type.cast<MemRefType>());
+      fifo_C_drain_IO_L1_out->setAttr("phism.variable_name", StringAttr::get(context, makeIndexName("fifo_C_drain_IO_L1_out", {x, y})));
+      fifo_C_drain_IO_L1_out->setAttr("phism.hls_stream", b.getUnitAttr());
+      fifo_C_drain_IO_L1_out->setAttr("phism.type_name", StringAttr::get(context, IO_type));
+      fifo_C_drain_IO_L1_out->setAttr("phism.hls_pragma", StringAttr::get(context, "STREAM variable=$ depth=2,RESOURCE variable=$ core=FIFO_SRL"));
+
+      fifo_C_drain_C_drain_IO_L1_outs[x][y] = fifo_C_drain_IO_L1_out;
+    }
+  }
+
+  // Add C drain L1
+  FuncOp C_drain_IO_L1_out_inter_trans = create_drain_IO_L1_out_inter_trans(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L1_in_inter_trans", /*is_boundary*/ false, b);
+  FuncOp C_drain_IO_L1_out_inter_trans_boundary = create_drain_IO_L1_out_inter_trans(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L1_in_inter_trans_boundary", /*is_boundary*/ true, b);
+  FuncOp C_drain_IO_L1_out_intra_trans = create_drain_IO_L1_out_intra_trans(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L1_in_intra_trans", b);
+  FuncOp C_drain_IO_L1_out = create_drain_IO_L1_out(top_func_op, C_drain_IO_L1_out_inter_trans, C_drain_IO_L1_out_inter_trans_boundary, C_drain_IO_L1_out_intra_trans, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L1_out", /*is_boundary*/ false, b);
+  FuncOp C_drain_IO_L1_out_boundary = create_drain_IO_L1_out(top_func_op, C_drain_IO_L1_out_inter_trans, C_drain_IO_L1_out_inter_trans_boundary, C_drain_IO_L1_out_intra_trans, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L1_out_boundary", /*is_boundary*/ true, b);
+
+  for (unsigned x = 0; x < PE_dims; x++) {
+    for (unsigned y = 0; y < PE_dims; y++) {
+
+      bool is_boundary = (y == (PE_dims - 1));
+
+      // C_drain indices need to be swapped (TODO how to scale to 3x3 arrays)
+      // 0,0 -> 0,0 | 0,1 -> 1,0 | 1,0 -> 0,1 | 1,1 -> 1,1
+      unsigned fifo_C_drain_x = (x == y) ? x : (x ^ 1);
+      unsigned fifo_C_drain_y = (x == y) ? y : (y ^ 1);
+
+      if (is_boundary) {
+        SmallVector<Value> C_drain_IO_L1_out_boundary_operands = {fifo_C_drain_C_drain_IO_L1_outs[x][y], fifo_C_drains[fifo_C_drain_x][fifo_C_drain_y]}; // TODO how to scale fifo_C_drain_C_drain_IO_L1_outs indices to 3x3
+        addIndexesAsOperands(C_drain_IO_L1_out_boundary_operands, {x , y}, "C_drain_IO_L1_out_boundary", context, C_drain_IO_L1_out_boundary.getLoc(), b);
+
+        CallOp C_drain_IO_L1_out_boundary_call = b.create<CallOp>(
+          C_drain_IO_L1_out_boundary.getLoc(),
+          C_drain_IO_L1_out_boundary,
+          C_drain_IO_L1_out_boundary_operands
+        );
+
+      }
+      else {
+        SmallVector<Value> C_drain_IO_L1_out_operands = {fifo_C_drain_C_drain_IO_L1_outs[x][1], fifo_C_drain_C_drain_IO_L1_outs[x][y], fifo_C_drains[fifo_C_drain_x][fifo_C_drain_y]}; // TODO how to scale fifo_C_drain_C_drain_IO_L1_outs indices to 3x3
+        addIndexesAsOperands(C_drain_IO_L1_out_operands, {x , y}, "C_drain_IO_L1_out", context, C_drain_IO_L1_out.getLoc(), b);
+
+        CallOp C_drain_IO_L1_out_call = b.create<CallOp>(
+          C_drain_IO_L1_out.getLoc(),
+          C_drain_IO_L1_out,
+          C_drain_IO_L1_out_operands
+        );
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------------------
+
+  // Allocate C drain L2 IO
+  // 1D vector: [id]
+  SmallVector<memref::AllocaOp, 2> fifo_C_drain_IO_L2_outs(2);
+  for (unsigned id = 0; id < PE_dims; id++) {
+    memref::AllocaOp fifo_C_drain_IO_L2_out = b.create<memref::AllocaOp>(loc, C_type.cast<MemRefType>());
+    fifo_C_drain_IO_L2_out->setAttr("phism.variable_name", StringAttr::get(context, makeIndexName("fifo_C_drain_IO_L2_out", {id})));
+    fifo_C_drain_IO_L2_out->setAttr("phism.hls_stream", b.getUnitAttr());
+    fifo_C_drain_IO_L2_out->setAttr("phism.type_name", StringAttr::get(context, IO_type));
+    fifo_C_drain_IO_L2_out->setAttr("phism.hls_pragma", StringAttr::get(context, "STREAM variable=$ depth=2,RESOURCE variable=$ core=FIFO_SRL"));
+
+    fifo_C_drain_IO_L2_outs[id] = fifo_C_drain_IO_L2_out;
+  } 
+
+  // Add C drain L2
+  FuncOp C_drain_IO_L2_out = create_drain_IO_L2_out(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L2_out", /*is_boundary*/ false, b);
+
+  SmallVector<Value> C_drain_IO_L2_out_operands = {fifo_C_drain_IO_L2_outs[1], fifo_C_drain_IO_L2_outs[0], fifo_C_drain_C_drain_IO_L1_outs[0][0]};
+  addIndexesAsOperands(C_drain_IO_L2_out_operands, {0}, "C_drain_IO_L2_out", context, C_drain_IO_L2_out.getLoc(), b);
+
+  CallOp C_drain_IO_L2_out_call = b.create<CallOp>(
+    C_drain_IO_L2_out.getLoc(),
+    C_drain_IO_L2_out,
+    C_drain_IO_L2_out_operands
+  );
+
+  // Add C drain L2 boundary
+  FuncOp C_drain_IO_L2_out_boundary = create_drain_IO_L2_out(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L2_out_boundary", /*is_boundary*/ true, b);
+
+  SmallVector<Value> C_drain_IO_L2_out_boundary_operands = {fifo_C_drain_IO_L2_outs[1], fifo_C_drain_C_drain_IO_L1_outs[1][0]};
+  addIndexesAsOperands(C_drain_IO_L2_out_boundary_operands, {0}, "C_drain_IO_L2_out_boundary", context, C_drain_IO_L2_out_boundary.getLoc(), b);
+
+  CallOp C_drain_IO_L2_out_boundary_call = b.create<CallOp>(
+    C_drain_IO_L2_out_boundary.getLoc(),
+    C_drain_IO_L2_out_boundary,
+    C_drain_IO_L2_out_boundary_operands
+  );
+
+  // ---------------------------------------------------------------------------------------------------------
+
+  // Allocate C drain L3 IO
+  memref::AllocaOp fifo_C_drain_IO_L3_out_serialize = b.create<memref::AllocaOp>(loc, C_type.cast<MemRefType>());
+  fifo_C_drain_IO_L3_out_serialize->setAttr("phism.variable_name", StringAttr::get(context, "fifo_C_drain_IO_L3_out_serialize"));
+  fifo_C_drain_IO_L3_out_serialize->setAttr("phism.hls_stream", b.getUnitAttr());
+  fifo_C_drain_IO_L3_out_serialize->setAttr("phism.type_name", StringAttr::get(context, IO_type));
+  fifo_C_drain_IO_L3_out_serialize->setAttr("phism.hls_pragma", StringAttr::get(context, "STREAM variable=$ depth=2"));
+
+  // Add C drain L3
+  FuncOp C_drain_IO_L3_out = create_drain_IO_L3_out(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L3_out", b);
+
+  SmallVector<Value> C_drain_IO_L3_out_operands = {fifo_C_drain_IO_L3_out_serialize, fifo_C_drain_IO_L2_outs[0]};
+
+  CallOp C_drain_IO_L3_out_call = b.create<CallOp>(
+    C_drain_IO_L3_out.getLoc(),
+    C_drain_IO_L3_out,
+    C_drain_IO_L3_out_operands
+  );
+
+  // ---------------------------------------------------------------------------------------------------------
+
+  // Add C drain L3 serialize
+  FuncOp C_drain_IO_L3_out_serialize = create_drain_IO_L3_out_serialize(top_func_op, C_type.cast<MemRefType>(), IO_type, "C_drain_IO_L3_out_serialize", b);
+
+  SmallVector<Value> C_drain_IO_L3_out_serialize_operands = {top_func_op.getArguments()[10], fifo_C_drain_IO_L3_out_serialize};
+
+  CallOp C_drain_IO_L3_out_serialize_call = b.create<CallOp>(
+    C_drain_IO_L3_out_serialize.getLoc(),
+    C_drain_IO_L3_out_serialize,
+    C_drain_IO_L3_out_serialize_operands
+  );
+
+  // ---------------------------------------------------------------------------------------------------------
+
   original_PE_call_op.erase();
   for_ops[0].erase();
   for_ops[1].erase();
-
-
-
 }
 
 namespace {
